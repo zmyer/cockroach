@@ -871,6 +871,15 @@ func (r *Replica) checkBatchRequest(ba roachpb.BatchRequest) error {
 	return nil
 }
 
+func mkl(ba *roachpb.BatchRequest) func(string, ...interface{}) {
+	_, debug := ba.GetArg(roachpb.BeginTransaction)
+	return func(msg string, args ...interface{}) {
+		if debug {
+			log.Warningf("DEBUG: "+msg, args...)
+		}
+	}
+}
+
 // beginCmds waits for any overlapping, already-executing commands via
 // the command queue and adds itself to queues based on keys affected by the
 // batched commands. This gates subsequent commands with overlapping keys or
@@ -879,6 +888,7 @@ func (r *Replica) checkBatchRequest(ba roachpb.BatchRequest) error {
 // commands are done and can be removed from the queue.
 func (r *Replica) beginCmds(ba *roachpb.BatchRequest) func(*roachpb.BatchResponse, *roachpb.Error) {
 	var cmd *cmd
+	l := mkl(ba)
 	// Don't use the command queue for inconsistent reads.
 	if ba.ReadConsistency != roachpb.INCONSISTENT {
 		spans := make([]roachpb.Span, 0, len(ba.Requests))
@@ -889,10 +899,11 @@ func (r *Replica) beginCmds(ba *roachpb.BatchRequest) func(*roachpb.BatchRespons
 		}
 		var wg sync.WaitGroup
 		r.mu.Lock()
-		r.mu.cmdQ.getWait(readOnly, &wg, spans...)
+		r.mu.cmdQ.getWait(readOnly, &wg, l, spans...)
 		cmd = r.mu.cmdQ.add(readOnly, spans...)
 		r.mu.Unlock()
 		wg.Wait()
+		l("waited")
 	}
 
 	// Update the incoming timestamp if unset. Wait until after any

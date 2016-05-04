@@ -1724,7 +1724,9 @@ func (s *Store) Send(ctx context.Context, ba roachpb.BatchRequest) (br *roachpb.
 			})
 		}
 		rng.assert5725(ba)
+		l("send to replica")
 		br, pErr = rng.Send(ctx, ba)
+		l("from replica: %v", pErr)
 		if pErr == nil {
 			return br, nil
 		}

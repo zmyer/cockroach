@@ -102,9 +102,9 @@ func prepareSpans(spans ...roachpb.Span) {
 // commands which overlap the specified key ranges. If an end key is empty, it
 // only affects the start key. The caller should call wg.Wait() to wait for
 // confirmation that all gating commands have completed or failed, and then
-// call Add() to add the keys to the command queue. readOnly is true if the
+// call add() to add the keys to the command queue. readOnly is true if the
 // requester is a read-only command; false for read-write.
-func (cq *CommandQueue) getWait(readOnly bool, wg *sync.WaitGroup, spans ...roachpb.Span) {
+func (cq *CommandQueue) getWait(readOnly bool, wg *sync.WaitGroup, l func(string, ...interface{}), spans ...roachpb.Span) {
 	prepareSpans(spans...)
 
 	for i := 0; i < len(spans); i++ {
@@ -128,8 +128,10 @@ func (cq *CommandQueue) getWait(readOnly bool, wg *sync.WaitGroup, spans ...roac
 		// entries. If we encounter a covering entry, we remove it from the
 		// interval tree and add all of its children.
 		restart := false
+		l("overlaps: %+v", overlaps)
 		for _, cmd := range overlaps {
 			if !cmd.expanded && len(cmd.children) != 0 {
+				l("expanding: %+v", cmd)
 				restart = true
 				cmd.expanded = true
 				if err := cq.tree.Delete(cmd, false /* !fast */); err != nil {
