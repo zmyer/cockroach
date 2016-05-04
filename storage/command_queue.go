@@ -36,7 +36,7 @@ import (
 // pending command can proceed.
 //
 // After waiting, a command is added to the queue's already-executing
-// set via Add(). Add accepts a parameter indicating whether the
+// set via add(). Add accepts a parameter indicating whether the
 // command is read-only. Read-only commands don't need to wait on
 // other read-only commands, so the wait group returned via GetWait()
 // doesn't include read-only on read-only overlapping commands as an
