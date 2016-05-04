@@ -26,6 +26,7 @@ import (
 	"math"
 	"math/rand"
 	"reflect"
+	"strings"
 	"sync"
 	"time"
 
@@ -873,9 +874,10 @@ func (r *Replica) checkBatchRequest(ba roachpb.BatchRequest) error {
 
 func mkl(ba *roachpb.BatchRequest) func(string, ...interface{}) {
 	_, debug := ba.GetArg(roachpb.BeginTransaction)
+	debug = debug && strings.Contains(ba.Txn.Name, "executor")
 	return func(msg string, args ...interface{}) {
 		if debug {
-			log.Warningf("DEBUG: "+msg, args...)
+			log.Warningf(ba.Txn.ID.Short()+": "+msg, args...)
 		}
 	}
 }
@@ -899,8 +901,9 @@ func (r *Replica) beginCmds(ba *roachpb.BatchRequest) func(*roachpb.BatchRespons
 		}
 		var wg sync.WaitGroup
 		r.mu.Lock()
+		l("%s", ba)
 		r.mu.cmdQ.getWait(readOnly, &wg, l, spans...)
-		cmd = r.mu.cmdQ.add(readOnly, spans...)
+		cmd = r.mu.cmdQ.add(readOnly, ba, l, spans...)
 		r.mu.Unlock()
 		wg.Wait()
 		l("waited")
@@ -961,7 +964,8 @@ func (r *Replica) endCmds(cmd *cmd, ba *roachpb.BatchRequest, br *roachpb.BatchR
 			}
 		}
 	}
-	r.mu.cmdQ.remove(cmd)
+	l := mkl(ba)
+	r.mu.cmdQ.remove(cmd, l)
 }
 
 // applyTimestampCache moves the batch timestamp forward depending on

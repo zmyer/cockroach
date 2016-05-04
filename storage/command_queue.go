@@ -63,6 +63,7 @@ type cmd struct {
 	expanded bool              // have the children been added
 	pending  []*sync.WaitGroup // pending commands gated on cmd
 	children []cmd
+	ba       *roachpb.BatchRequest
 }
 
 // ID implements interval.Interface.
@@ -128,10 +129,14 @@ func (cq *CommandQueue) getWait(readOnly bool, wg *sync.WaitGroup, l func(string
 		// entries. If we encounter a covering entry, we remove it from the
 		// interval tree and add all of its children.
 		restart := false
-		l("overlaps: %+v", overlaps)
 		for _, cmd := range overlaps {
+			var s string
+			if cmd.ba != nil && cmd.ba.Txn != nil {
+				s = cmd.ba.Txn.ID.Short()
+			}
+			l("overlap: %v %s", cmd.id, s)
 			if !cmd.expanded && len(cmd.children) != 0 {
-				l("expanding: %+v", cmd)
+				l("expanding: %+v", cmd.id)
 				restart = true
 				cmd.expanded = true
 				if err := cq.tree.Delete(cmd, false /* !fast */); err != nil {
@@ -353,7 +358,7 @@ func (o *overlapHeap) PopOverlap() *cmd {
 //
 // Add should be invoked after waiting on already-executing, overlapping
 // commands via the WaitGroup initialized through getWait().
-func (cq *CommandQueue) add(readOnly bool, spans ...roachpb.Span) *cmd {
+func (cq *CommandQueue) add(readOnly bool, ba *roachpb.BatchRequest, l func(string, ...interface{}), spans ...roachpb.Span) *cmd {
 	prepareSpans(spans...)
 
 	// Compute the min and max key that covers all of the spans.
@@ -376,6 +381,7 @@ func (cq *CommandQueue) add(readOnly bool, spans ...roachpb.Span) *cmd {
 
 	// Create the covering entry.
 	cmd := &cmds[0]
+	cmd.ba = ba
 	cmd.id = cq.nextID()
 	cmd.key = interval.Range{
 		Start: interval.Comparable(minKey),
@@ -384,6 +390,7 @@ func (cq *CommandQueue) add(readOnly bool, spans ...roachpb.Span) *cmd {
 	cmd.readOnly = readOnly
 	cmd.expanded = false
 
+	var maxID int64
 	if len(spans) > 1 {
 		// Populate the covering entry's children.
 		cmd.children = cmds[1:]
@@ -396,8 +403,10 @@ func (cq *CommandQueue) add(readOnly bool, spans ...roachpb.Span) *cmd {
 			}
 			child.readOnly = readOnly
 			child.expanded = true
+			maxID = cmd.children[i].id
 		}
 	}
+	l("adding [%s,%s) @ %d: %d children (maxid %d)", minKey, maxKey, cmd.id, len(spans), maxID)
 
 	if err := cq.tree.Insert(cmd, false /* !fast */); err != nil {
 		panic(err)
@@ -409,11 +418,11 @@ func (cq *CommandQueue) add(readOnly bool, spans ...roachpb.Span) *cmd {
 // specified key has completed and should be removed. Any pending
 // commands waiting on this command will be signaled if this is the
 // only command upon which they are still waiting.
-func (cq *CommandQueue) remove(cmd *cmd) {
+func (cq *CommandQueue) remove(cmd *cmd, l func(string, ...interface{})) {
 	if cmd == nil {
 		return
 	}
-
+	l("remove %d expanded=%t children=%d", cmd.id, cmd.expanded, len(cmd.children))
 	if !cmd.expanded {
 		if err := cq.tree.Delete(cmd, false /* !fast */); err != nil {
 			panic(err)
@@ -431,6 +440,10 @@ func (cq *CommandQueue) remove(cmd *cmd) {
 			}
 		}
 	}
+	if cq.tree.Len() == 0 {
+		l("================= TREE IS EMPTY")
+	}
+
 }
 
 func (cq *CommandQueue) nextID() int64 {
