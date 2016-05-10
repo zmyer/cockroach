@@ -1028,7 +1028,7 @@ func (r *Replica) endCmds(
 	// Only update the timestamp cache if the command succeeded and is
 	// marked as affecting the cache. Inconsistent reads are excluded.
 	log.Trace(ctx, "begin update tsCache")
-	if pErr == nil && ba.ReadConsistency != roachpb.INCONSISTENT {
+	if false && (pErr == nil && ba.ReadConsistency != roachpb.INCONSISTENT) {
 		timestamp := ba.Timestamp
 		for _, union := range ba.Requests {
 			args := union.GetInner()
