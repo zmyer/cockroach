@@ -30,6 +30,7 @@ import (
 
 	"github.com/cockroachdb/cockroach/roachpb"
 	"github.com/cockroachdb/cockroach/util/encoding"
+	"github.com/cockroachdb/cockroach/util/humanizeutil"
 	"github.com/cockroachdb/cockroach/util/log"
 	"github.com/cockroachdb/cockroach/util/randutil"
 	"github.com/cockroachdb/cockroach/util/stop"
@@ -340,18 +341,21 @@ func runMVCCBatchPut(emk engineMaker, valueSize, batchSize int, b *testing.B) {
 
 		batch := eng.NewBatch()
 
+		var puts int
+		var key roachpb.Key
 		for j := i; j < end; j++ {
-			key := roachpb.Key(encoding.EncodeUvarintAscending(keyBuf[:4], uint64(j)))
+			key = roachpb.Key(encoding.EncodeUvarintAscending(keyBuf[:4], uint64(j)))
 			ts := makeTS(timeutil.Now().UnixNano(), 0)
+			puts++
 			if err := MVCCPut(context.Background(), batch, nil, key, ts, value, nil); err != nil {
 				b.Fatalf("failed put: %s", err)
 			}
 		}
 
+		fmt.Println("PUTS:", puts, "x", len(key)+valueSize, "SIZE: ", humanizeutil.IBytes(int64(len(batch.Repr()))))
 		if err := batch.Commit(); err != nil {
 			b.Fatal(err)
 		}
-
 		batch.Close()
 	}
 
@@ -421,6 +425,7 @@ func runMVCCDeleteRange(emk engineMaker, valueBytes int, b *testing.B) {
 	numKeys := rangeBytes / (overhead + valueBytes)
 	_, dir, stopper := setupMVCCData(emk, 1, numKeys, valueBytes, b)
 	stopper.Stop()
+	fmt.Println(numKeys)
 
 	b.SetBytes(rangeBytes)
 	b.StopTimer()
@@ -435,12 +440,17 @@ func runMVCCDeleteRange(emk engineMaker, valueBytes int, b *testing.B) {
 			b.Fatal(err)
 		}
 		dupEng, stopper := emk(b, locDirty)
+		dupEng = dupEng.NewBatch()
 
 		b.StartTimer()
-		_, err := MVCCDeleteRange(context.Background(), dupEng, &MVCCStats{}, roachpb.KeyMin, roachpb.KeyMax, 0, roachpb.MaxTimestamp, nil, false)
+		k, err := MVCCDeleteRange(context.Background(), dupEng, &MVCCStats{}, roachpb.KeyMin, roachpb.KeyMax, 0, roachpb.MaxTimestamp, nil, true /* HACK */)
 		if err != nil {
 			b.Fatal(err)
 		}
+		if i == b.N-1 {
+			fmt.Println("SIZE/keys: ", numKeys, "|", len(k), "x", valueBytes, " => ", humanizeutil.IBytes(int64(len(dupEng.Repr())/numKeys)))
+		}
+		dupEng.Commit()
 		b.StopTimer()
 
 		stopper.Stop()
