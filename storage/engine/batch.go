@@ -16,7 +16,21 @@
 
 package engine
 
-import "github.com/cockroachdb/cockroach/roachpb"
+import (
+	"bytes"
+	"fmt"
+
+	"github.com/cockroachdb/cockroach/roachpb"
+	"github.com/cockroachdb/cockroach/util/log"
+)
+
+// #cgo darwin LDFLAGS: -Wl,-undefined -Wl,dynamic_lookup
+// #cgo !darwin LDFLAGS: -Wl,-unresolved-symbols=ignore-all
+// #cgo linux LDFLAGS: -lrt
+//
+// #include <stdlib.h>
+// #include "rocksdb/db.h"
+import "C"
 
 const (
 	batchTypeDeletion byte = 0x0
@@ -67,6 +81,7 @@ const (
 // correctly. Note that the encoding of these keys needs to match up with the
 // encoding in rocksdb/db.cc:EncodeKey().
 type rocksDBBatchBuilder struct {
+	rdb   *C.DBEngine
 	repr  []byte
 	count int
 }
@@ -187,6 +202,15 @@ func (b *rocksDBBatchBuilder) encodeKeyValue(key MVCCKey, value []byte, tag byte
 }
 
 func (b *rocksDBBatchBuilder) Put(key MVCCKey, value []byte) {
+	var buf bytes.Buffer
+	fmt.Fprintf(&buf, "Put on %p of %p: %s(%s): ", b, b.rdb, key.Key, key.Timestamp)
+	var meta MVCCMetadata
+	if err := meta.Unmarshal(value); err != nil {
+		fmt.Fprintf(&buf, "%p", value)
+	} else {
+		fmt.Fprintf(&buf, "meta IsInline: %t", meta.IsInline())
+	}
+	log.Info(buf.String())
 	b.encodeKeyValue(key, value, batchTypeValue)
 }
 
@@ -195,6 +219,7 @@ func (b *rocksDBBatchBuilder) Merge(key MVCCKey, value []byte) {
 }
 
 func (b *rocksDBBatchBuilder) Clear(key MVCCKey) {
+	log.Infof("Clear on %p of %p: %s(%s)", b, b.rdb, key.Key, key.Timestamp)
 	b.maybeInit()
 	b.count++
 	pos := len(b.repr)

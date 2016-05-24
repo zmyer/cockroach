@@ -540,6 +540,7 @@ func newRocksDBBatch(parent *RocksDB) *rocksDBBatch {
 		parent: parent,
 		batch:  C.DBNewBatch(parent.rdb),
 	}
+	r.builder.rdb = r.batch
 	r.distinct.rocksDBBatch = r
 	return r
 }
@@ -634,6 +635,7 @@ func (r *rocksDBBatch) Commit() error {
 	} else if r.builder.count > 0 {
 		// Fast-path which avoids flushing mutations to the C++ batch. Instead, we
 		// directly apply the mutations to the database.
+		log.Infof("Commit on %p of %p", r, r.batch)
 		if err := r.parent.ApplyBatchRepr(r.builder.Finish()); err != nil {
 			return err
 		}
@@ -669,6 +671,7 @@ func (r *rocksDBBatch) flushMutations() {
 		return
 	}
 	r.flushes++
+	log.InfofDepth(1, "flushMutations on %p of %p", r, r.batch)
 	if err := r.ApplyBatchRepr(r.builder.Finish()); err != nil {
 		panic(err)
 	}
@@ -676,6 +679,7 @@ func (r *rocksDBBatch) flushMutations() {
 
 type rocksDBIterator struct {
 	engine Reader
+	rdb    *C.DBEngine
 	iter   *C.DBIterator
 	valid  bool
 	key    C.DBKey
@@ -705,6 +709,7 @@ func newRocksDBIterator(rdb *C.DBEngine, prefix bool, engine Reader) Iterator {
 }
 
 func (r *rocksDBIterator) init(rdb *C.DBEngine, prefix bool, engine Reader) {
+	r.rdb = rdb
 	r.iter = C.DBNewIter(rdb, C.bool(prefix))
 	r.engine = engine
 }
@@ -727,6 +732,9 @@ func (r *rocksDBIterator) Close() {
 }
 
 func (r *rocksDBIterator) Seek(key MVCCKey) {
+	defer func(preKey string) {
+		log.Infof("Seek on %p of %p: wanted: %s, got: %s -> %s, valid: %t", r, r.rdb, key.Key, preKey, r.unsafeKey(), r.Valid())
+	}(r.unsafeKey().String())
 	r.checkEngineOpen()
 	if len(key.Key) == 0 {
 		// start=Key("") needs special treatment since we need
@@ -741,6 +749,9 @@ func (r *rocksDBIterator) Seek(key MVCCKey) {
 }
 
 func (r *rocksDBIterator) SeekReverse(key MVCCKey) {
+	defer func(preKey string) {
+		log.Infof("SeekReverse on %p of %p: wanted: %s, got: %s -> %s, valid: %t", r, r.rdb, key.Key, preKey, r.unsafeKey(), r.Valid())
+	}(r.unsafeKey().String())
 	r.checkEngineOpen()
 	if len(key.Key) == 0 {
 		r.setState(C.DBIterSeekToLast(r.iter))
@@ -765,21 +776,33 @@ func (r *rocksDBIterator) Valid() bool {
 }
 
 func (r *rocksDBIterator) Next() {
+	defer func(key string) {
+		log.Infof("Next on %p of %p: %s -> %s, valid: %t", r, r.rdb, key, r.unsafeKey(), r.Valid())
+	}(r.unsafeKey().String())
 	r.checkEngineOpen()
 	r.setState(C.DBIterNext(r.iter, false /* !skip_current_key_versions */))
 }
 
 func (r *rocksDBIterator) Prev() {
+	defer func(key string) {
+		log.Infof("Prev on %p of %p: %s -> %s, valid: %t", r, r.rdb, key, r.unsafeKey(), r.Valid())
+	}(r.unsafeKey().String())
 	r.checkEngineOpen()
 	r.setState(C.DBIterPrev(r.iter, false /* !skip_current_key_versions */))
 }
 
 func (r *rocksDBIterator) NextKey() {
+	defer func(key string) {
+		log.Infof("NextKey on %p of %p: %s -> %s, valid: %t", r, r.rdb, key, r.unsafeKey(), r.Valid())
+	}(r.unsafeKey().String())
 	r.checkEngineOpen()
 	r.setState(C.DBIterNext(r.iter, true /* skip_current_key_versions */))
 }
 
 func (r *rocksDBIterator) PrevKey() {
+	defer func(key string) {
+		log.Infof("PrevKey on %p of %p: %s -> %s, valid: %t", r, r.rdb, key, r.unsafeKey(), r.Valid())
+	}(r.unsafeKey().String())
 	r.checkEngineOpen()
 	r.setState(C.DBIterPrev(r.iter, true /* skip_current_key_versions */))
 }
@@ -969,6 +992,8 @@ func dbPut(rdb *C.DBEngine, key MVCCKey, value []byte) error {
 		return emptyKeyError()
 	}
 
+	log.Infof("dbPut of %p: %s - %p", rdb, key.Key, value)
+
 	// *Put, *Get, and *Delete call memcpy() (by way of MemTable::Add)
 	// when called, so we do not need to worry about these byte slices
 	// being reclaimed by the GC.
@@ -987,6 +1012,8 @@ func dbMerge(rdb *C.DBEngine, key MVCCKey, value []byte) error {
 }
 
 func dbApplyBatchRepr(rdb *C.DBEngine, repr []byte) error {
+	log.Infof("dbApplyBatchRepr on %p: %p", rdb, repr)
+
 	return statusToError(C.DBApplyBatchRepr(rdb, goToCSlice(repr)))
 }
 
@@ -1035,6 +1062,9 @@ func dbClear(rdb *C.DBEngine, key MVCCKey) error {
 	if len(key.Key) == 0 {
 		return emptyKeyError()
 	}
+
+	log.Infof("dbClear of %p: %s", rdb, key.Key)
+
 	return statusToError(C.DBDelete(rdb, goToCKey(key)))
 }
 

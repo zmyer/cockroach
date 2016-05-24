@@ -22,6 +22,7 @@ import (
 	"errors"
 	"fmt"
 	"math"
+	"runtime/debug"
 	"sync"
 
 	"golang.org/x/net/context"
@@ -1048,6 +1049,7 @@ func mvccPutInternal(
 	// Verify we're not mixing inline and non-inline values.
 	putIsInline := timestamp.Equal(roachpb.ZeroTimestamp)
 	if ok && putIsInline != buf.meta.IsInline() {
+		debug.PrintStack()
 		return util.Errorf("%q: put is inline=%t, but existing value is inline=%t",
 			metaKey, putIsInline, buf.meta.IsInline())
 	}
