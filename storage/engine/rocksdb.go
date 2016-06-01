@@ -532,7 +532,7 @@ type rocksDBBatch struct {
 	prefixIter rocksDBBatchIterator
 	normalIter rocksDBBatchIterator
 	builder    rocksDBBatchBuilder
-	distinct   distinctBatch
+	//distinct   distinctBatch
 }
 
 func newRocksDBBatch(parent *RocksDB) *rocksDBBatch {
@@ -541,12 +541,12 @@ func newRocksDBBatch(parent *RocksDB) *rocksDBBatch {
 		batch:  C.DBNewBatch(parent.rdb),
 	}
 	r.builder.rdb = r.batch
-	r.distinct.rocksDBBatch = r
+	//r.distinct.rocksDBBatch = r
 	return r
 }
 
 func (r *rocksDBBatch) Close() {
-	r.distinct.close()
+	//r.distinct.close()
 	if i := &r.prefixIter.rocksDBIterator; i.iter != nil {
 		i.destroy()
 	}
@@ -663,7 +663,9 @@ func (r *rocksDBBatch) Defer(fn func()) {
 }
 
 func (r *rocksDBBatch) Distinct() ReadWriter {
-	return &r.distinct
+	//return &r.distinct
+	//r.flushMutations()
+	return r
 }
 
 func (r *rocksDBBatch) flushMutations() {
@@ -732,10 +734,14 @@ func (r *rocksDBIterator) Close() {
 }
 
 func (r *rocksDBIterator) Seek(key MVCCKey) {
+	b, _ := r.engine.(*rocksDBBatch)
 	defer func(preKey string) {
-		log.Infof("Seek on %p of %p: wanted: %s, got: %s -> %s, valid: %t", r, r.rdb, key.Key, preKey, r.unsafeKey(), r.Valid())
+		log.Infof("Seek on %p of %p: wanted: %s, got: %s -> %s, valid: %t, len %d, eng=%T\n%+v", r, r.rdb, key.Key, preKey, r.unsafeKey(), r.Valid(), len(r.unsafeValue()), b, r)
 	}(r.unsafeKey().String())
 	r.checkEngineOpen()
+	if b != nil {
+		b.flushMutations()
+	}
 	if len(key.Key) == 0 {
 		// start=Key("") needs special treatment since we need
 		// to access start[0] in an explicit seek.

@@ -1422,7 +1422,7 @@ func (r *Replica) handleRaftReady() error {
 	defer batch.Close()
 	if !raft.IsEmptySnap(rd.Snapshot) {
 		var err error
-		if lastIndex, err = r.applySnapshot(batch, rd.Snapshot); err != nil {
+		if lastIndex, err = r.applySnapshot(batch, rd.HardState, rd.Snapshot); err != nil {
 			return err
 		}
 		// TODO(bdarnell): update coalesced heartbeat mapping with snapshot info.
@@ -1433,11 +1433,13 @@ func (r *Replica) handleRaftReady() error {
 			return err
 		}
 	}
+	log.Warningf("HARDSTATE")
 	if !raft.IsEmptyHardState(rd.HardState) {
 		if err := r.setHardState(batch, rd.HardState); err != nil {
-			return err
+			panic(err)
 		}
 	}
+	log.Warningf("COMMIT")
 	if err := batch.Commit(); err != nil {
 		return err
 	}

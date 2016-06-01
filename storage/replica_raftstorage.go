@@ -18,6 +18,7 @@ package storage
 
 import (
 	"bytes"
+	"strings"
 	"time"
 
 	"github.com/coreos/etcd/raft"
@@ -634,7 +635,7 @@ func (r *Replica) updateRangeInfo(desc *roachpb.RangeDescriptor) error {
 
 // applySnapshot updates the replica based on the given snapshot.
 // Returns the new last index.
-func (r *Replica) applySnapshot(batch engine.Batch, snap raftpb.Snapshot) (uint64, error) {
+func (r *Replica) applySnapshot(batch engine.Batch, hs raftpb.HardState, snap raftpb.Snapshot) (uint64, error) {
 	snapData := roachpb.RaftSnapshotData{}
 	err := proto.Unmarshal(snap.Data, &snapData)
 	if err != nil {
@@ -662,11 +663,25 @@ func (r *Replica) applySnapshot(batch engine.Batch, snap raftpb.Snapshot) (uint6
 	// that predate the snapshot will be orphaned and never truncated or GC'd.
 	iter := newReplicaDataIterator(&desc, batch, false /* !replicatedOnly */)
 	defer iter.Close()
+	var hsKey engine.MVCCKey
 	for ; iter.Valid(); iter.Next() {
-		if err := batch.Clear(iter.Key()); err != nil {
-			return 0, err
+		if strings.HasSuffix(iter.Key().Key.String(), "HardState") {
+			hsKey = iter.Key()
+		} else {
+			if err := batch.Clear(iter.Key()); err != nil {
+				return 0, err
+			}
 		}
 	}
+
+	try := func() {
+		if hsKey.Key != nil {
+			if err := batch.Clear(hsKey); err != nil {
+				panic(err)
+			}
+		}
+	}
+	_ = try
 
 	// Determine the unreplicated key prefix so we can drop any
 	// unreplicated keys from the snapshot.
@@ -681,6 +696,10 @@ func (r *Replica) applySnapshot(batch engine.Batch, snap raftpb.Snapshot) (uint6
 			Key:       kv.Key,
 			Timestamp: kv.Timestamp,
 		}
+		if strings.HasSuffix(mvccKey.Key.String(), "HardState") {
+			log.Warningf("mvccKey: %s", mvccKey.Key)
+			panic("f")
+		}
 		if err := batch.Put(mvccKey, kv.Value); err != nil {
 			return 0, err
 		}
@@ -693,14 +712,20 @@ func (r *Replica) applySnapshot(batch engine.Batch, snap raftpb.Snapshot) (uint6
 		}
 	}
 
-	// Write the snapshot's Raft log into the range.
-	if _, err := r.append(batch, 0, logEntries); err != nil {
-		return 0, err
-	}
-
+	log.Warningf("________________________________________________________")
+	try()
 	// Read the leader lease.
 	lease, err := loadLeaderLease(batch, desc.RangeID)
 	if err != nil {
+		return 0, err
+	}
+
+	if err := r.setHardState(batch, hs); err != nil {
+		panic(err)
+	}
+
+	// Write the snapshot's Raft log into the range.
+	if _, err := r.append(batch, 0, logEntries); err != nil {
 		return 0, err
 	}
 

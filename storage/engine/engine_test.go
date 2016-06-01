@@ -27,9 +27,12 @@ import (
 
 	"golang.org/x/net/context"
 
+	"github.com/cockroachdb/cockroach/keys"
 	"github.com/cockroachdb/cockroach/roachpb"
 	"github.com/cockroachdb/cockroach/util/leaktest"
+	"github.com/cockroachdb/cockroach/util/log"
 	"github.com/cockroachdb/cockroach/util/stop"
+	"github.com/coreos/etcd/raft/raftpb"
 	"github.com/gogo/protobuf/proto"
 )
 
@@ -749,4 +752,46 @@ func insertKeysAndValues(keys []MVCCKey, values [][]byte, engine Engine, t *test
 			t.Errorf("put: expected no error, but got %s", err)
 		}
 	}
+}
+
+func TestEngineBatchIteratorSkew(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	runWithAllEngines(func(eng Engine, t *testing.T) {
+		const rangeID = 42
+		hs := keys.RaftHardStateKey(rangeID)
+		ll := keys.RangeLeaderLeaseKey(rangeID)
+		_ = ll
+
+		b := eng.NewBatch()
+
+		if err := MVCCPutProto(context.Background(), b, nil, ll, roachpb.ZeroTimestamp, nil, &roachpb.Lease{}); err != nil {
+			t.Fatal(err)
+		}
+
+		if err := MVCCPutProto(context.Background(), b, nil, hs, roachpb.ZeroTimestamp, nil, &raftpb.HardState{}); err != nil {
+			t.Fatal(err)
+		}
+
+		if err := b.Commit(); err != nil {
+			t.Fatal(err)
+		}
+
+		b = eng.NewBatch()
+
+		log.Warningf("_______________")
+		if err := b.Clear(MVCCKey{Key: hs}); err != nil {
+			t.Fatal(err)
+		}
+
+		log.Warningf("get")
+		if _, err := MVCCGetProto(context.Background(), b, ll, roachpb.ZeroTimestamp, true, nil, &roachpb.Lease{}); err != nil {
+			t.Fatal(err)
+		}
+
+		log.Warningf("put")
+		if err := MVCCPutProto(context.Background(), b, nil, hs, roachpb.ZeroTimestamp, nil, &raftpb.HardState{}); err != nil {
+			t.Fatal(err)
+		}
+
+	}, t)
 }
