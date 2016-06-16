@@ -202,6 +202,12 @@ func loadState(reader engine.Reader, desc *roachpb.RangeDescriptor) (storagebase
 		return storagebase.ReplicaState{}, err
 	}
 
+	if truncState, err := loadTruncatedState(reader, desc.RangeID); err != nil {
+		return storagebase.ReplicaState{}, err
+	} else {
+		s.TruncatedState = &truncState
+	}
+
 	return s, nil
 }
 
@@ -503,12 +509,35 @@ func setMVCCStats(eng engine.ReadWriter, rangeID roachpb.RangeID, newMS enginepb
 	return engine.MVCCSetRangeStats(context.Background(), eng, rangeID, &newMS)
 }
 
+// TODO(tschottdorf): write and use setLease, too.
 func loadLease(eng engine.Reader, rangeID roachpb.RangeID) (*roachpb.Lease, error) {
 	lease := &roachpb.Lease{}
 	if _, err := engine.MVCCGetProto(context.Background(), eng, keys.RangeLeaderLeaseKey(rangeID), hlc.ZeroTimestamp, true, nil, lease); err != nil {
 		return nil, err
 	}
 	return lease, nil
+}
+
+func loadTruncatedState(
+	eng engine.Reader, rangeID roachpb.RangeID,
+) (roachpb.RaftTruncatedState, error) {
+	var truncState roachpb.RaftTruncatedState
+	if _, err := engine.MVCCGetProto(context.Background(), eng,
+		keys.RaftTruncatedStateKey(rangeID), hlc.ZeroTimestamp, true,
+		nil, &truncState); err != nil {
+		return roachpb.RaftTruncatedState{}, err
+	}
+	return truncState, nil
+}
+
+func setTruncatedState(
+	eng engine.ReadWriter,
+	ms *enginepb.MVCCStats,
+	rangeID roachpb.RangeID,
+	truncState roachpb.RaftTruncatedState,
+) error {
+	return engine.MVCCPutProto(context.Background(), eng, ms,
+		keys.RaftTruncatedStateKey(rangeID), hlc.ZeroTimestamp, nil, &truncState)
 }
 
 // getLeaderLease returns the current leader lease and a boolean which
@@ -855,6 +884,8 @@ func containsKeyRange(desc roachpb.RangeDescriptor, start, end roachpb.Key) bool
 
 // getLastReplicaGCTimestamp reads the timestamp at which the replica was
 // last checked for garbage collection.
+//
+// TODO(tschottdorf):
 func (r *Replica) getLastReplicaGCTimestamp() (hlc.Timestamp, error) {
 	key := keys.RangeLastReplicaGCTimestampKey(r.RangeID)
 	timestamp := hlc.Timestamp{}
@@ -907,6 +938,13 @@ func (r *Replica) State() storagebase.RangeInfo {
 	ri.ReplicaState = *(protoutil.Clone(&r.mu.state)).(*storagebase.ReplicaState)
 	ri.LastIndex = r.mu.lastIndex
 	ri.NumPending = uint64(len(r.mu.pendingCmds))
+
+	if diskState, err := loadState(r.store.Engine(), r.mu.state.Desc); err != nil {
+		log.Warning(err)
+	} else if true || !reflect.DeepEqual(diskState, ri.ReplicaState) {
+		log.Warningf("on-disk and in-memory state diverged:\n%+v\n%+v", diskState, ri.ReplicaState)
+	}
+
 	return ri
 }
 

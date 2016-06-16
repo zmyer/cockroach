@@ -1321,9 +1321,21 @@ func (s *Store) BootstrapRange(initialValues []roachpb.KeyValue) error {
 	if err := engine.AccountForSelf(ms, desc.RangeID); err != nil {
 		return err
 	}
+
 	if err := engine.MVCCSetRangeStats(ctx, batch, desc.RangeID, ms); err != nil {
 		return err
 	}
+
+	var state storagebase.ReplicaState
+	state.Stats = *ms
+	state.TruncatedState = &roachpb.RaftTruncatedState{
+		Term:  raftInitialLogTerm,
+		Index: raftInitialLogIndex,
+	}
+
+	//if err := setTruncatedState(batch, ms, desc.RangeID, *state.TruncatedState); err != nil {
+	//	return err
+	//}
 
 	if err := batch.Commit(); err != nil {
 		return err

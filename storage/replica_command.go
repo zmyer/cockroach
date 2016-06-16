@@ -2260,11 +2260,18 @@ func (r *Replica) splitTrigger(
 	rightMS.Add(origStats)
 	// Remove stats from the left side of the split.
 	rightMS.Subtract(leftMS)
+
+	//if err := setTruncatedState(batch, &rightMS, newRng.RangeID, roachpb.RaftTruncatedState{
+	//	Term:  raftInitialLogTerm,
+	//	Index: raftInitialLogIndex,
+	//}); err != nil {
+	//	return util.Errorf("unable to write truncated state: %s", err)
+	//}
+
 	if err := setMVCCStats(batch, newRng.RangeID, rightMS); err != nil {
 		return util.Errorf("unable to write MVCC stats: %s", err)
 	}
 	log.Trace(ctx, "computed stats for new range")
-
 	// Copy the timestamp cache into the new range.
 	r.mu.Lock()
 	newRng.mu.Lock()
