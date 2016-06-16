@@ -106,7 +106,7 @@ const (
 
 	// DefaultGossipStoresInterval is the default interval for gossiping storage-
 	// related info.
-	DefaultGossipStoresInterval = 1 * time.Minute
+	DefaultGossipStoresInterval = 1 * time.Second
 )
 
 // Storage is an interface which allows the gossip instance

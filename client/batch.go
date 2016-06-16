@@ -17,6 +17,8 @@
 package client
 
 import (
+	"fmt"
+
 	"github.com/cockroachdb/cockroach/roachpb"
 	"github.com/cockroachdb/cockroach/util"
 )
@@ -85,11 +87,15 @@ func (b *Batch) MustPErr() *roachpb.Error {
 }
 
 func (b *Batch) prepare() error {
+	fmt.Println("d1")
 	for _, r := range b.Results {
+		fmt.Println("d2")
 		if r.Err != nil {
+			fmt.Println("d3")
 			return r.Err
 		}
 	}
+	fmt.Println("d4")
 	return nil
 }
 

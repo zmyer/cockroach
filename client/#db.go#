@@ -488,7 +488,7 @@ func (db *DB) send(ba roachpb.BatchRequest) (*roachpb.BatchResponse, *roachpb.Er
 
 	tracing.AnnotateTrace()
 	fmt.Println("f6")
-	br, pErr := db.sender.Send(context.TODO(), ba)
+	br, pErr := db.sender.nd(context.TODO(), ba)
 	fmt.Println("f7")
 	if pErr != nil {
 		if log.V(1) {
