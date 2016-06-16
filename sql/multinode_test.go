@@ -20,7 +20,9 @@ import (
 	gosql "database/sql"
 	"fmt"
 	"testing"
+	"time"
 
+	"github.com/cockroachdb/cockroach/roachpb"
 	"github.com/cockroachdb/cockroach/security"
 	"github.com/cockroachdb/cockroach/server"
 	"github.com/cockroachdb/cockroach/testutils/sqlutils"
@@ -43,16 +45,18 @@ func SetupMultinodeTestCluster(t testing.TB, nodes int, name string) ([]*gosql.D
 		t.Fatal("invalid cluster size: ", nodes)
 	}
 	var servers []server.TestServer
+	fmt.Println("Starting first server")
 	first := server.StartTestServer(t)
 	servers = append(servers, first)
 	for i := 1; i < nodes; i++ {
+		fmt.Printf("Starting %d server\n", i+1)
 		servers = append(servers, server.StartTestServerJoining(t, first))
 	}
 
 	var conns []*gosql.DB
 	var closes []func() error
 	var cleanups []func()
-
+	fmt.Println("Creating cleanup functions and opening connections")
 	for i, s := range servers {
 		pgURL, cleanupFn := sqlutils.PGUrl(t, s.ServingAddr(), security.RootUser,
 			fmt.Sprintf("node%d", i))
@@ -65,7 +69,7 @@ func SetupMultinodeTestCluster(t testing.TB, nodes int, name string) ([]*gosql.D
 		cleanups = append(cleanups, cleanupFn)
 		conns = append(conns, db)
 	}
-
+	fmt.Println("Creating database for server 1")
 	if _, err := conns[0].Exec(fmt.Sprintf(`CREATE DATABASE %s`, name)); err != nil {
 		t.Fatal(err)
 	}
@@ -82,7 +86,43 @@ func SetupMultinodeTestCluster(t testing.TB, nodes int, name string) ([]*gosql.D
 		}
 	}
 
+	if _, err := conns[0].Exec(`CREATE TABLE testing (k INT PRIMARY KEY, v INT)`); err != nil {
+		t.Fatal(err)
+	}
+	fmt.Println("before wait")
+	waitForReplication(servers)
+	fmt.Println("after wait")
+	if err := servers[0].DB().Put("aa", "bb"); err != nil {
+		fmt.Println(err)
+	}
+	fmt.Println("after put")
 	return conns, f
+}
+
+// Waits until all of the nodes have the same number of replicas.
+// NOTE: the StoreID of each server's store must be the index of the server in
+// the servers array + 1. This will occur naturally if servers are indexed in
+// the order they were created. 1
+func waitForReplication(servers []server.TestServer) {
+	notReplicated := true
+	for notReplicated {
+		noneReplicated := true
+		for i, server := range servers {
+			store, _ := server.Stores().GetStore(roachpb.StoreID(i + 1))
+			if store != nil {
+				if store.ReplicaCount() >= 1 && noneReplicated {
+					noneReplicated = false
+				} else if store.ReplicaCount() >= 1 {
+					notReplicated = false
+				}
+			}
+		}
+		time.Sleep(250 * time.Millisecond)
+	}
+	for i, server := range servers {
+		store, _ := server.Stores().GetStore(roachpb.StoreID(i + 1))
+		fmt.Printf("server %d has %d replicas\n", i, store.ReplicaCount())
+	}
 }
 
 // NB(davidt): until `SetupMultinodeTestCluster` actually returns a cluster
@@ -91,29 +131,35 @@ func SetupMultinodeTestCluster(t testing.TB, nodes int, name string) ([]*gosql.D
 func TestMultinodeCockroach(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer tracing.Disable()()
-
 	conns, cleanup := SetupMultinodeTestCluster(t, 3, "Testing")
+	fmt.Println("1")
 	defer cleanup()
-
-	if _, err := conns[0].Exec(`CREATE TABLE testing (k INT PRIMARY KEY, v INT)`); err != nil {
-		t.Fatal(err)
-	}
-
+	fmt.Println("2")
 	if _, err := conns[0].Exec(`INSERT INTO testing VALUES (5, 1), (4, 2), (1, 2)`); err != nil {
 		t.Fatal(err)
 	}
-
+	fmt.Println("3")
 	if r, err := conns[1].Query(`SELECT * FROM testing WHERE k = 5`); err != nil {
 		t.Fatal(err)
 	} else if !r.Next() {
 		t.Fatal("no rows")
 	}
-
+	fmt.Println("4")
+	if r, err := conns[1].Query(`SELECT * FROM testing WHERE k = 5`); err != nil {
+		t.Fatal(err)
+	} else if !r.Next() {
+		t.Fatal("no rows")
+	}
+	fmt.Println("5")
+	for i := 0; i < 1000; i++ {
+		conns[0].Exec(fmt.Sprintf("INSERT INTO testing VALUES (%d, %d)", i, i+1))
+	}
+	fmt.Println("6")
 	if r, err := conns[2].Exec(`DELETE FROM testing`); err != nil {
 		t.Fatal(err)
 	} else if rows, err := r.RowsAffected(); err != nil {
 		t.Fatal(err)
-	} else if expected, actual := int64(3), rows; expected != actual {
+	} else if expected, actual := int64(1000), rows; expected != actual {
 		t.Fatalf("wrong row count deleted: expected %d actual %d", expected, actual)
 	}
 }
