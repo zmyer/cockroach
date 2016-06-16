@@ -1196,7 +1196,7 @@ func (s *Store) getReplicaLocked(rangeID roachpb.RangeID) (*Replica, error) {
 	if rng, ok := s.mu.replicas[rangeID]; ok {
 		return rng, nil
 	}
-	return nil, roachpb.NewRangeNotFoundError(rangeID)
+	return nil, roachpb.NewRangeNotFoundError(rangeID) // <<--
 }
 
 // LookupReplica looks up a replica via binary search over the
