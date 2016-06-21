@@ -3592,6 +3592,50 @@ func TestPushTxnUpgradeExistingTxn(t *testing.T) {
 	}
 }
 
+// TestPushTxnQueryPusheerHasNewerVersion verifies that PushTxn
+// returns pushee data in a request when when a pusher is aware of a
+// newer version of the pushee.
+func TestPushTxnQueryPusheerHasNewerVersion(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	tc := testContext{}
+	tc.Start(t)
+	defer tc.Stop()
+
+	key := roachpb.Key("key")
+	pushee := newTransaction("test", key, 1, enginepb.SERIALIZABLE, tc.clock)
+	pushee.Priority = 1
+	pushee.Epoch = 12345
+	pushee.Sequence = 2
+	ts := hlc.Timestamp{WallTime: 1}
+	pushee.Timestamp = ts
+	pushee.LastHeartbeat = &ts
+
+	pusher := newTransaction("test", key, 1, enginepb.SERIALIZABLE, tc.clock)
+	pusher.Priority = 3
+
+	_, btH := beginTxnArgs(key, pushee)
+	put := putArgs(key, key)
+	if _, pErr := maybeWrapWithBeginTransaction(tc.Sender(), tc.rng.context(context.Background()), btH, &put); pErr != nil {
+		t.Fatal(pErr)
+	}
+
+	// Make the pushee in the request has updated information.
+	pushee.Priority++
+	args := pushTxnArgs(pusher, pushee, roachpb.PUSH_QUERY)
+
+	resp, pErr := tc.SendWrapped(&args)
+	if pErr != nil {
+		t.Fatal(pErr)
+	}
+	reply := resp.(*roachpb.PushTxnResponse)
+	expTxn := pushee.Clone()
+	expTxn.Writing = true
+
+	if !reflect.DeepEqual(expTxn, reply.PusheeTxn) {
+		t.Fatalf("unexpected push txn; expected:\n%+v\ngot:\n%+v", expTxn, reply.PusheeTxn)
+	}
+}
+
 // TestPushTxnHeartbeatTimeout verifies that a txn which
 // hasn't been heartbeat within 2x the heartbeat interval can be
 // pushed/aborted.
