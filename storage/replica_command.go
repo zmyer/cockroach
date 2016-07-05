@@ -2694,7 +2694,7 @@ func (r *Replica) ChangeReplicas(
 	descKey := keys.RangeDescriptorKey(desc.StartKey)
 
 	if err := r.store.DB().Txn(func(txn *client.Txn) error {
-		txn.Proto.Name = replicaChangeTxnName
+		txn.Proto.Name = replicaChangeTxnPrefix + " " + updatedDesc.String()
 		// TODO(tschottdorf): oldDesc is used for sanity checks related to #7224.
 		// Remove when that has been solved. The failure mode is likely based on
 		// prior divergence of the Replica (in which case the check below does not
@@ -2729,10 +2729,8 @@ func (r *Replica) ChangeReplicas(
 			return err
 		}
 
-		// End the transaction manually instead of letting RunTransaction
-		// loop do it, in order to provide a commit trigger.
-		b = &client.Batch{}
-		b.AddRawRequest(&roachpb.EndTransactionRequest{
+		// End the transaction manually in order to provide a commit trigger.
+		etReq := &roachpb.EndTransactionRequest{
 			Commit: true,
 			InternalCommitTrigger: &roachpb.InternalCommitTrigger{
 				ChangeReplicasTrigger: &roachpb.ChangeReplicasTrigger{
@@ -2742,7 +2740,9 @@ func (r *Replica) ChangeReplicas(
 					NextReplicaID:   updatedDesc.NextReplicaID,
 				},
 			},
-		})
+		}
+		b = &client.Batch{}
+		b.AddRawRequest(etReq)
 		if err := txn.Run(b); err != nil {
 			return err
 		}
@@ -2753,6 +2753,7 @@ func (r *Replica) ChangeReplicas(
 			panic(fmt.Sprintf("committed replica change, but oldDesc != assumedOldDesc:\n%+v\n%+v\nnew desc:\n%+v",
 				oldDesc, desc, updatedDesc))
 		}
+		log.Infof("change replicas of %d: committed %s with result %+v", changeType, updatedDesc)
 		return nil
 	}); err != nil {
 		return errors.Wrapf(err, "change replicas of range %d failed", rangeID)

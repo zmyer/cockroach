@@ -26,6 +26,7 @@ import (
 	"math/rand"
 	"reflect"
 	"sort"
+	"strings"
 	"sync"
 	"time"
 
@@ -76,7 +77,7 @@ const (
 	// the key space being written is starting out empty.
 	optimizePutThreshold = 10
 
-	replicaChangeTxnName = "change-replica"
+	replicaChangeTxnPrefix = "change-replica"
 )
 
 // This flag controls whether Transaction entries are automatically gc'ed
@@ -1878,9 +1879,9 @@ func (r *Replica) applyRaftCommand(
 	}
 
 	// TODO(tschottdorf): remove when #7224 is cleared.
-	if ba.Txn != nil && ba.Txn.Name == replicaChangeTxnName {
-		log.Infof("range %d: applied part of replica change txn: %s, pErr=%v",
-			r.RangeID, ba, rErr)
+	if ba.Txn != nil && strings.HasPrefix(ba.Txn.Name, replicaChangeTxnPrefix) {
+		log.Infof("range %d: applied part of replica change txn: %s %s, pErr=%v",
+			r.RangeID, ba.Txn.Name, ba, rErr)
 	}
 
 	defer batch.Close()
