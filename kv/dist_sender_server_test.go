@@ -194,6 +194,11 @@ func TestMultiRangeBoundedBatch(t *testing.T) {
 	}
 }
 
+// TestMultiRangeBoundedBatchSaturated runs a batch request with multiple spans
+// which saturate at different points in the process.
+// It exercises an edge case in DistSender in which a saturated request being
+// masked out means that a multi-range mode ends before the originally assumed
+// key range is exhausted.
 func TestMultiRangeBoundedBatchSaturated(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	s, _, _ := serverutils.StartServer(t, base.TestServerArgs{})
