@@ -867,7 +867,8 @@ func (ds *DistSender) sendChunk(ctx context.Context, ba roachpb.BatchRequest) (*
 				}
 				boundedArg, ok := args.(roachpb.Bounded)
 				if !ok {
-					// Non-bounded request. We will have to query all ranges.
+					// Non-bounded request. We will have to continue querying
+					// at least long as this request isn't satisfied.
 					needAnother = true
 					continue
 				}
@@ -897,29 +898,39 @@ func (ds *DistSender) sendChunk(ctx context.Context, ba roachpb.BatchRequest) (*
 			}
 		}
 
+		if needAnother {
+			if isReverse {
+				// In next iteration, query previous range.
+				// We use the StartKey of the current descriptor as opposed to the
+				// EndKey of the previous one since that doesn't have bugs when
+				// stale descriptors come into play.
+				rs.EndKey, err = prev(ba, desc.StartKey)
+			} else {
+				// In next iteration, query next range.
+				// It's important that we use the EndKey of the current descriptor
+				// as opposed to the StartKey of the next one: if the former is stale,
+				// it's possible that the next range has since merged the subsequent
+				// one, and unless both descriptors are stale, the next descriptor's
+				// StartKey would move us to the beginning of the current range,
+				// resulting in a duplicate scan.
+				log.Warningf("rs.key before: %s with %s and %s", rs.Key, ba, desc.EndKey)
+				rs.Key, err = next(ba, desc.EndKey)
+				log.Warningf("rs.key after: %s", rs.Key)
+			}
+			if err != nil {
+				return nil, roachpb.NewError(err), false
+			}
+			// It's possible that the key update has created an empty interval,
+			// indicating that we're done. For example, a bounded scan could
+			// have been masked out due to having saturated; if that was the
+			// reason for needing the next descriptor, we now have
+			// rs.Key=KeyMax.
+			needAnother = rs.Key.Less(rs.EndKey)
+		}
+
 		// If this was the last range accessed by this call, exit loop.
 		if !needAnother {
 			return br, nil, false
-		}
-
-		if isReverse {
-			// In next iteration, query previous range.
-			// We use the StartKey of the current descriptor as opposed to the
-			// EndKey of the previous one since that doesn't have bugs when
-			// stale descriptors come into play.
-			rs.EndKey, err = prev(ba, desc.StartKey)
-		} else {
-			// In next iteration, query next range.
-			// It's important that we use the EndKey of the current descriptor
-			// as opposed to the StartKey of the next one: if the former is stale,
-			// it's possible that the next range has since merged the subsequent
-			// one, and unless both descriptors are stale, the next descriptor's
-			// StartKey would move us to the beginning of the current range,
-			// resulting in a duplicate scan.
-			rs.Key, err = next(ba, desc.EndKey)
-		}
-		if err != nil {
-			return nil, roachpb.NewError(err), false
 		}
 		log.Trace(ctx, "querying next range")
 	}
