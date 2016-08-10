@@ -37,7 +37,7 @@ import (
 )
 
 func init() {
-	grpc.EnableTracing = false
+	grpc.EnableTracing = true
 }
 
 const (
