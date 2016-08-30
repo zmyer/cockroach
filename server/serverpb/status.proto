@@ -52,9 +52,53 @@ message NodeRequest {
   string node_id = 1;
 }
 
+// RaftState gives internal details about a Raft group's state.
+// Closely mirrors the upstream definitions in
+// github.com/coreos/etcd/raft/raftpb/raft.proto.
+message RaftState {
+  message HardState {
+  	uint64 term   = 1;
+  	uint64 vote   = 2;
+  	uint64 commit = 3;
+  }
+
+  enum StateType {
+    UNKNOWN = 0;
+    FOLLOWER = 1;
+    CANDIDATE = 2;
+    LEADER = 3;
+    // This indicates that our Replica has no active in-memory Raft group. It
+    // does not exist upstream.
+    DORMANT = 4;
+  }
+
+  message Progress {
+    enum ProgressStateType {
+      UNKNOWN = 0;
+  	  PROBE = 1;
+  	  REPLICATE = 2;
+  	  SNAPSHOT = 3;
+    }
+    uint64 match = 1;
+    uint64 next = 2;
+    ProgressStateType state = 3;
+    bool paused = 4;
+    uint64 pending_snapshot = 5;
+  }
+
+  uint64 id = 1 [(gogoproto.customname) = "ID"];
+  HardState hard_state  = 2 [(gogoproto.nullable) = false];
+  // Lead is part of Raft's SoftState.
+  uint64 lead = 3;
+  // State is part of Raft's SoftState.
+  StateType state = 4;
+  uint64 applied = 5;
+  map<uint64, Progress> progress = 6 [(gogoproto.nullable) = false];
+}
+
 message RangeInfo {
   PrettySpan span = 1 [(gogoproto.nullable) = false];
-  string raft_state = 2;
+  RaftState raft_state = 2 [(gogoproto.nullable) = false];
   storage.storagebase.RangeInfo state = 4 [(gogoproto.nullable) = false];
 }
 
