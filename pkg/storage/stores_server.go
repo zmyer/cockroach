@@ -11,28 +11,25 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
 // implied. See the License for the specific language governing
 // permissions and limitations under the License.
-//
-// Author: Tristan Rice (rice@fn.lc)
 
 package storage
 
 import (
 	"bytes"
+	"context"
 
 	"github.com/pkg/errors"
-	"golang.org/x/net/context"
 
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 )
 
-// Server implements FreezeServer and ConsistencyServer.
+// Server implements ConsistencyServer.
 type Server struct {
 	descriptor *roachpb.NodeDescriptor
 	stores     *Stores
 }
 
-var _ FreezeServer = Server{}
 var _ ConsistencyServer = Server{}
 
 // MakeServer returns a new instance of Server.
@@ -52,19 +49,6 @@ func (is Server) execStoreCommand(h StoreRequestHeader, f func(*Store) error) er
 	return f(store)
 }
 
-// PollFrozen implements the FreezeServer interface.
-func (is Server) PollFrozen(
-	ctx context.Context, args *PollFrozenRequest,
-) (*PollFrozenResponse, error) {
-	resp := &PollFrozenResponse{}
-	err := is.execStoreCommand(args.StoreRequestHeader,
-		func(s *Store) error {
-			resp.Results = s.FrozenStatus(args.CollectFrozen)
-			return nil
-		})
-	return resp, err
-}
-
 // CollectChecksum implements ConsistencyServer.
 func (is Server) CollectChecksum(
 	ctx context.Context, req *CollectChecksumRequest,
@@ -80,12 +64,21 @@ func (is Server) CollectChecksum(
 			if err != nil {
 				return err
 			}
-			resp.Checksum = c.checksum
-			if !bytes.Equal(req.Checksum, c.checksum) {
-				log.Errorf(ctx, "consistency check failed on range ID %s: expected checksum %x, got %x",
-					req.RangeID, req.Checksum, c.checksum)
-				resp.Snapshot = c.snapshot
+			ccr := c.CollectChecksumResponse
+			if !bytes.Equal(req.Checksum, ccr.Checksum) {
+				// If this check is false, then this request is the replica carrying out
+				// the consistency check. The message is spurious, but we want to leave the
+				// snapshot (if present) intact.
+				if len(req.Checksum) > 0 {
+					log.Errorf(ctx, "consistency check failed on range r%d: expected checksum %x, got %x",
+						req.RangeID, req.Checksum, ccr.Checksum)
+					// Leave resp.Snapshot alone so that the caller will receive what's
+					// in it (if anything).
+				}
+			} else {
+				ccr.Snapshot = nil
 			}
+			resp = &ccr
 			return nil
 		})
 	return resp, err

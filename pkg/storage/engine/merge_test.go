@@ -11,9 +11,6 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
 // implied. See the License for the specific language governing
 // permissions and limitations under the License.
-//
-// Author: Tobias Schottdorf (tobias.schottdorf@gmail.com)
-// Author: Peter Mattis (peter@cockroachlabs.com)
 
 package engine
 
@@ -42,14 +39,14 @@ type tsSample struct {
 }
 
 func gibberishString(n int) string {
-	b := make([]byte, n, n)
+	b := make([]byte, n)
 	for i := 0; i < n; i++ {
 		b[i] = byte(rand.Intn(math.MaxUint8 + 1))
 	}
 	return string(b)
 }
 
-func mustMarshal(m proto.Message) []byte {
+func mustMarshal(m protoutil.Message) []byte {
 	b, err := protoutil.Marshal(m)
 	if err != nil {
 		panic(err)
@@ -65,7 +62,7 @@ func appender(s string) []byte {
 
 // timeSeries generates a simple InternalTimeSeriesData object which starts
 // at the given timestamp and has samples of the given duration. The object is
-// stored in an MVCCMetadata object and marshalled to bytes.
+// stored in an MVCCMetadata object and marshaled to bytes.
 func timeSeries(start int64, duration int64, samples ...tsSample) []byte {
 	tsv := timeSeriesAsValue(start, duration, samples...)
 	return mustMarshal(&enginepb.MVCCMetadata{RawBytes: tsv.RawBytes})
@@ -166,10 +163,10 @@ func TestGoMerge(t *testing.T) {
 			continue
 		}
 		var resultV, expectedV enginepb.MVCCMetadata
-		if err := proto.Unmarshal(result, &resultV); err != nil {
+		if err := protoutil.Unmarshal(result, &resultV); err != nil {
 			t.Fatal(err)
 		}
-		if err := proto.Unmarshal(c.expected, &expectedV); err != nil {
+		if err := protoutil.Unmarshal(c.expected, &expectedV); err != nil {
 			t.Fatal(err)
 		}
 		if !reflect.DeepEqual(resultV, expectedV) {
@@ -263,7 +260,7 @@ func TestGoMerge(t *testing.T) {
 		updateTS := unmarshalTimeSeries(t, c.update)
 
 		// Directly test the C++ implementation of merging using goMerge.  goMerge
-		// operates directly on marshalled bytes.
+		// operates directly on marshaled bytes.
 		result, err := goMerge(c.existing, c.update)
 		if err != nil {
 			t.Errorf("goMerge error on case %d: %s", i, err.Error())
@@ -293,11 +290,11 @@ func TestGoMerge(t *testing.T) {
 }
 
 // unmarshalTimeSeries unmarshals the time series value stored in the given byte
-// array. It is assumed that the time series value was originally marshalled as
+// array. It is assumed that the time series value was originally marshaled as
 // a MVCCMetadata with an inline value.
 func unmarshalTimeSeries(t testing.TB, b []byte) roachpb.InternalTimeSeriesData {
 	var meta enginepb.MVCCMetadata
-	if err := proto.Unmarshal(b, &meta); err != nil {
+	if err := protoutil.Unmarshal(b, &meta); err != nil {
 		t.Fatalf("error unmarshalling time series in text: %s", err.Error())
 	}
 	valueTS, err := MakeValue(meta).GetTimeseries()

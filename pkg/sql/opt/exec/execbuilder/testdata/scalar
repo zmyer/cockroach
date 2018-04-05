@@ -1,0 +1,527 @@
+# This file tests that we build scalar expressions correctly. We do this by
+# putting expressions inside projections and checking that they roundtrip
+# correctly.
+
+exec-raw
+CREATE DATABASE t;
+CREATE TABLE t.t (a INT, b INT, c INT, d INT, j JSONB, s STRING)
+----
+
+exec-explain
+SELECT 1 + 2
+----
+render       0  render  ·         ·                 (column1)  ·
+ │           0  ·       render 0  3                 ·          ·
+ └── values  1  values  ·         ·                 ()         ·
+·            1  ·       size      0 columns, 1 row  ·          ·
+
+exec-explain
+SELECT true
+----
+render       0  render  ·         ·                 (column1)  ·
+ │           0  ·       render 0  true              ·          ·
+ └── values  1  values  ·         ·                 ()         ·
+·            1  ·       size      0 columns, 1 row  ·          ·
+
+exec-explain
+SELECT false
+----
+render       0  render  ·         ·                 (column1)  ·
+ │           0  ·       render 0  false             ·          ·
+ └── values  1  values  ·         ·                 ()         ·
+·            1  ·       size      0 columns, 1 row  ·          ·
+
+exec-explain
+SELECT (1, 2)
+----
+render       0  render  ·         ·                 (column1)  ·
+ │           0  ·       render 0  (1, 2)            ·          ·
+ └── values  1  values  ·         ·                 ()         ·
+·            1  ·       size      0 columns, 1 row  ·          ·
+
+exec-explain
+SELECT (true, false)
+----
+render       0  render  ·         ·                 (column1)  ·
+ │           0  ·       render 0  (true, false)     ·          ·
+ └── values  1  values  ·         ·                 ()         ·
+·            1  ·       size      0 columns, 1 row  ·          ·
+
+exec-explain
+SELECT 1 + 2 FROM t.t
+----
+render     0  render  ·         ·          (column8)  ·
+ │         0  ·       render 0  3          ·          ·
+ └── scan  1  scan    ·         ·          ()         ·
+·          1  ·       table     t@primary  ·          ·
+·          1  ·       spans     ALL        ·          ·
+
+exec-explain
+SELECT a + 2 FROM t.t
+----
+render     0  render  ·         ·          (column8)  ·
+ │         0  ·       render 0  a + 2      ·          ·
+ └── scan  1  scan    ·         ·          (a)        ·
+·          1  ·       table     t@primary  ·          ·
+·          1  ·       spans     ALL        ·          ·
+
+exec-explain
+SELECT a >= 5 AND b <= 10 AND c < 4 FROM t.t
+----
+render     0  render  ·         ·                                     (column8)  ·
+ │         0  ·       render 0  ((a >= 5) AND (b <= 10)) AND (c < 4)  ·          ·
+ └── scan  1  scan    ·         ·                                     (a, b, c)  ·
+·          1  ·       table     t@primary                             ·          ·
+·          1  ·       spans     ALL                                   ·          ·
+
+exec-explain
+SELECT a >= 5 OR b <= 10 OR c < 4  FROM t.t
+----
+render     0  render  ·         ·                                   (column8)  ·
+ │         0  ·       render 0  ((a >= 5) OR (b <= 10)) OR (c < 4)  ·          ·
+ └── scan  1  scan    ·         ·                                   (a, b, c)  ·
+·          1  ·       table     t@primary                           ·          ·
+·          1  ·       spans     ALL                                 ·          ·
+
+exec-explain
+SELECT NOT (a = 5) FROM t.t
+----
+render     0  render  ·         ·          (column8)  ·
+ │         0  ·       render 0  a != 5     ·          ·
+ └── scan  1  scan    ·         ·          (a)        ·
+·          1  ·       table     t@primary  ·          ·
+·          1  ·       spans     ALL        ·          ·
+
+exec-explain
+SELECT NOT (a > 5 AND b >= 10) FROM t.t
+----
+render     0  render  ·         ·                     (column8)  ·
+ │         0  ·       render 0  (a <= 5) OR (b < 10)  ·          ·
+ └── scan  1  scan    ·         ·                     (a, b)     ·
+·          1  ·       table     t@primary             ·          ·
+·          1  ·       spans     ALL                   ·          ·
+
+exec-explain
+SELECT (a >= 5 AND b <= 10) OR (a <= 10 AND c > 5) FROM t.t
+----
+render     0  render  ·         ·                                                    (column8)  ·
+ │         0  ·       render 0  ((a >= 5) AND (b <= 10)) OR ((a <= 10) AND (c > 5))  ·          ·
+ └── scan  1  scan    ·         ·                                                    (a, b, c)  ·
+·          1  ·       table     t@primary                                            ·          ·
+·          1  ·       spans     ALL                                                  ·          ·
+
+exec-explain
+SELECT NOT (a >= 5 OR b <= 10) AND NOT (c >= 10) FROM t.t
+----
+render     0  render  ·         ·                                    (column8)  ·
+ │         0  ·       render 0  ((a < 5) AND (b > 10)) AND (c < 10)  ·          ·
+ └── scan  1  scan    ·         ·                                    (a, b, c)  ·
+·          1  ·       table     t@primary                            ·          ·
+·          1  ·       spans     ALL                                  ·          ·
+
+exec-explain
+SELECT (a, b) = (1, 2)  FROM t.t
+----
+render     0  render  ·         ·                    (column8)  ·
+ │         0  ·       render 0  (a = 1) AND (b = 2)  ·          ·
+ └── scan  1  scan    ·         ·                    (a, b)     ·
+·          1  ·       table     t@primary            ·          ·
+·          1  ·       spans     ALL                  ·          ·
+
+exec-explain
+SELECT a IN (1, 2) FROM t.t
+----
+render     0  render  ·         ·            (column8)  ·
+ │         0  ·       render 0  a IN (1, 2)  ·          ·
+ └── scan  1  scan    ·         ·            (a)        ·
+·          1  ·       table     t@primary    ·          ·
+·          1  ·       spans     ALL          ·          ·
+
+exec-explain
+SELECT (a, b) IN ((1, 2), (3, 4)) FROM t.t
+----
+render     0  render  ·         ·                           (column8)  ·
+ │         0  ·       render 0  (a, b) IN ((1, 2), (3, 4))  ·          ·
+ └── scan  1  scan    ·         ·                           (a, b)     ·
+·          1  ·       table     t@primary                   ·          ·
+·          1  ·       spans     ALL                         ·          ·
+
+exec-explain
+SELECT (a, b + c, 5 + d * 2) = (b+c, 8, a - c)  FROM t.t
+----
+render     0  render  ·         ·                                                                (column8)     ·
+ │         0  ·       render 0  ((a = (b + c)) AND ((b + c) = 8)) AND (((d * 2) + 5) = (a - c))  ·             ·
+ └── scan  1  scan    ·         ·                                                                (a, b, c, d)  ·
+·          1  ·       table     t@primary                                                        ·             ·
+·          1  ·       spans     ALL                                                              ·             ·
+
+exec-explain
+SELECT ((a, b), (c, d)) = ((1, 2), (3, 4))  FROM t.t
+----
+render     0  render  ·         ·                                                (column8)     ·
+ │         0  ·       render 0  (((a = 1) AND (b = 2)) AND (c = 3)) AND (d = 4)  ·             ·
+ └── scan  1  scan    ·         ·                                                (a, b, c, d)  ·
+·          1  ·       table     t@primary                                        ·             ·
+·          1  ·       spans     ALL                                              ·             ·
+
+exec-explain
+SELECT (a, (b, 'a'), (c, 'b', 5)) = (9, (a+c, s), (5, s, a)) FROM t.t
+----
+render     0  render  ·         ·                                                                                      (column8)     ·
+ │         0  ·       render 0  (((((a = 9) AND (b = (a + c))) AND (s = 'a')) AND (c = 5)) AND (s = 'b')) AND (a = 5)  ·             ·
+ └── scan  1  scan    ·         ·                                                                                      (a, b, c, s)  ·
+·          1  ·       table     t@primary                                                                              ·             ·
+·          1  ·       spans     ALL                                                                                    ·             ·
+
+exec-explain
+SELECT a IS NULL FROM t.t
+----
+render     0  render  ·         ·          (column8)  ·
+ │         0  ·       render 0  a IS NULL  ·          ·
+ └── scan  1  scan    ·         ·          (a)        ·
+·          1  ·       table     t@primary  ·          ·
+·          1  ·       spans     ALL        ·          ·
+
+exec-explain
+SELECT a IS NOT DISTINCT FROM NULL FROM t.t
+----
+render     0  render  ·         ·          (column8)  ·
+ │         0  ·       render 0  a IS NULL  ·          ·
+ └── scan  1  scan    ·         ·          (a)        ·
+·          1  ·       table     t@primary  ·          ·
+·          1  ·       spans     ALL        ·          ·
+
+exec-explain
+SELECT a IS NOT DISTINCT FROM b FROM t.t
+----
+render     0  render  ·         ·                         (column8)  ·
+ │         0  ·       render 0  a IS NOT DISTINCT FROM b  ·          ·
+ └── scan  1  scan    ·         ·                         (a, b)     ·
+·          1  ·       table     t@primary                 ·          ·
+·          1  ·       spans     ALL                       ·          ·
+
+exec-explain
+SELECT a IS NOT NULL FROM t.t
+----
+render     0  render  ·         ·              (column8)  ·
+ │         0  ·       render 0  a IS NOT NULL  ·          ·
+ └── scan  1  scan    ·         ·              (a)        ·
+·          1  ·       table     t@primary      ·          ·
+·          1  ·       spans     ALL            ·          ·
+
+exec-explain
+SELECT a IS DISTINCT FROM NULL FROM t.t
+----
+render     0  render  ·         ·              (column8)  ·
+ │         0  ·       render 0  a IS NOT NULL  ·          ·
+ └── scan  1  scan    ·         ·              (a)        ·
+·          1  ·       table     t@primary      ·          ·
+·          1  ·       spans     ALL            ·          ·
+
+exec-explain
+SELECT a IS DISTINCT FROM b FROM t.t
+----
+render     0  render  ·         ·                     (column8)  ·
+ │         0  ·       render 0  a IS DISTINCT FROM b  ·          ·
+ └── scan  1  scan    ·         ·                     (a, b)     ·
+·          1  ·       table     t@primary             ·          ·
+·          1  ·       spans     ALL                   ·          ·
+
+exec-explain
+SELECT +a + (-b) FROM t.t
+----
+render     0  render  ·         ·          (column8)  ·
+ │         0  ·       render 0  a + (-b)   ·          ·
+ └── scan  1  scan    ·         ·          (a, b)     ·
+·          1  ·       table     t@primary  ·          ·
+·          1  ·       spans     ALL        ·          ·
+
+exec-explain
+SELECT CASE a WHEN 1 THEN 2 WHEN 2 THEN 3 ELSE 4 END FROM t.t
+----
+render     0  render  ·         ·                                              (column8)  ·
+ │         0  ·       render 0  CASE a WHEN 1 THEN 2 WHEN 2 THEN 3 ELSE 4 END  ·          ·
+ └── scan  1  scan    ·         ·                                              (a)        ·
+·          1  ·       table     t@primary                                      ·          ·
+·          1  ·       spans     ALL                                            ·          ·
+
+exec-explain
+SELECT CASE WHEN a = 2 THEN 1 ELSE 2 END FROM t.t
+----
+render     0  render  ·         ·                                  (column8)  ·
+ │         0  ·       render 0  CASE WHEN a = 2 THEN 1 ELSE 2 END  ·          ·
+ └── scan  1  scan    ·         ·                                  (a)        ·
+·          1  ·       table     t@primary                          ·          ·
+·          1  ·       spans     ALL                                ·          ·
+
+exec-explain
+SELECT CASE a + 3 WHEN 5 * b THEN 1 % b WHEN 6 THEN 2 ELSE -1 END FROM t.t
+----
+render     0  render  ·         ·                                                           (column8)  ·
+ │         0  ·       render 0  CASE a + 3 WHEN b * 5 THEN 1 % b WHEN 6 THEN 2 ELSE -1 END  ·          ·
+ └── scan  1  scan    ·         ·                                                           (a, b)     ·
+·          1  ·       table     t@primary                                                   ·          ·
+·          1  ·       spans     ALL                                                         ·          ·
+
+# Tests for CASE with no ELSE statement
+exec-explain
+SELECT CASE WHEN a = 2 THEN 1 END FROM t.t
+----
+render     0  render  ·         ·                           (column8)  ·
+ │         0  ·       render 0  CASE WHEN a = 2 THEN 1 END  ·          ·
+ └── scan  1  scan    ·         ·                           (a)        ·
+·          1  ·       table     t@primary                   ·          ·
+·          1  ·       spans     ALL                         ·          ·
+
+exec-explain
+SELECT CASE a WHEN 2 THEN 1 END FROM t.t
+----
+render     0  render  ·         ·                         (column8)  ·
+ │         0  ·       render 0  CASE a WHEN 2 THEN 1 END  ·          ·
+ └── scan  1  scan    ·         ·                         (a)        ·
+·          1  ·       table     t@primary                 ·          ·
+·          1  ·       spans     ALL                       ·          ·
+
+exec-explain allow-unsupported
+SELECT a FROM t.t WHERE a IS OF (INT)
+----
+filter     0  filter  ·       ·                         (a)  ·
+ │         0  ·       filter  t.public.t.a IS OF (INT)  ·    ·
+ └── scan  1  scan    ·       ·                         (a)  ·
+·          1  ·       table   t@primary                 ·    ·
+·          1  ·       spans   ALL                       ·    ·
+
+exec-explain
+SELECT LENGTH(s) FROM t.t
+----
+render     0  render  ·         ·          (column8)  ·
+ │         0  ·       render 0  length(s)  ·          ·
+ └── scan  1  scan    ·         ·          (s)        ·
+·          1  ·       table     t@primary  ·          ·
+·          1  ·       spans     ALL        ·          ·
+
+# Verify that the built function can be executed.
+exec-raw
+CREATE TABLE t.str (s STRING);
+INSERT INTO t.str VALUES ('a'), ('ab'), ('abc')
+----
+
+exec
+SELECT LENGTH(s) FROM t.str
+----
+column3:int
+1
+2
+3
+
+exec-explain
+SELECT j @> '{"a": 1}' FROM t.t
+----
+render     0  render  ·         ·                (column8)  ·
+ │         0  ·       render 0  j @> '{"a": 1}'  ·          ·
+ └── scan  1  scan    ·         ·                (j)        ·
+·          1  ·       table     t@primary        ·          ·
+·          1  ·       spans     ALL              ·          ·
+
+exec-explain
+SELECT '{"a": 1}' <@ j FROM t.t
+----
+render     0  render  ·         ·                (column8)  ·
+ │         0  ·       render 0  j @> '{"a": 1}'  ·          ·
+ └── scan  1  scan    ·         ·                (j)        ·
+·          1  ·       table     t@primary        ·          ·
+·          1  ·       spans     ALL              ·          ·
+
+exec-explain
+SELECT j->>'a' FROM t.t
+----
+render     0  render  ·         ·          (column8)  ·
+ │         0  ·       render 0  j->>'a'    ·          ·
+ └── scan  1  scan    ·         ·          (j)        ·
+·          1  ·       table     t@primary  ·          ·
+·          1  ·       spans     ALL        ·          ·
+
+exec-explain
+SELECT j->'a' FROM t.t
+----
+render     0  render  ·         ·          (column8)  ·
+ │         0  ·       render 0  j->'a'     ·          ·
+ └── scan  1  scan    ·         ·          (j)        ·
+·          1  ·       table     t@primary  ·          ·
+·          1  ·       spans     ALL        ·          ·
+
+exec-explain
+SELECT j ? 'a' FROM t.t
+----
+render     0  render  ·         ·          (column8)  ·
+ │         0  ·       render 0  j ? 'a'    ·          ·
+ └── scan  1  scan    ·         ·          (j)        ·
+·          1  ·       table     t@primary  ·          ·
+·          1  ·       spans     ALL        ·          ·
+
+exec-explain
+SELECT j ?| ARRAY['a', 'b', 'c'] FROM t.t
+----
+render     0  render  ·         ·                          (column8)  ·
+ │         0  ·       render 0  j ?| ARRAY['a', 'b', 'c']  ·          ·
+ └── scan  1  scan    ·         ·                          (j)        ·
+·          1  ·       table     t@primary                  ·          ·
+·          1  ·       spans     ALL                        ·          ·
+
+exec-explain
+SELECT j ?& ARRAY['a', 'b', 'c'] FROM t.t
+----
+render     0  render  ·         ·                          (column8)  ·
+ │         0  ·       render 0  j ?& ARRAY['a', 'b', 'c']  ·          ·
+ └── scan  1  scan    ·         ·                          (j)        ·
+·          1  ·       table     t@primary                  ·          ·
+·          1  ·       spans     ALL                        ·          ·
+
+exec-explain
+SELECT j#>ARRAY['a'] FROM t.t
+----
+render     0  render  ·         ·              (column8)  ·
+ │         0  ·       render 0  j#>ARRAY['a']  ·          ·
+ └── scan  1  scan    ·         ·              (j)        ·
+·          1  ·       table     t@primary      ·          ·
+·          1  ·       spans     ALL            ·          ·
+
+exec-explain
+SELECT j#>>ARRAY['a'] FROM t.t
+----
+render     0  render  ·         ·               (column8)  ·
+ │         0  ·       render 0  j#>>ARRAY['a']  ·          ·
+ └── scan  1  scan    ·         ·               (j)        ·
+·          1  ·       table     t@primary       ·          ·
+·          1  ·       spans     ALL             ·          ·
+
+
+exec-explain
+SELECT CAST(a AS string), b::float FROM t.t
+----
+render     0  render  ·         ·          (column8, column9)  ·
+ │         0  ·       render 0  a::STRING  ·                   ·
+ │         0  ·       render 1  b::FLOAT   ·                   ·
+ └── scan  1  scan    ·         ·          (a, b)              ·
+·          1  ·       table     t@primary  ·                   ·
+·          1  ·       spans     ALL        ·                   ·
+
+exec-explain
+SELECT CAST(a + b + c AS string) FROM t.t
+----
+render     0  render  ·         ·                      (column8)  ·
+ │         0  ·       render 0  (c + (a + b))::STRING  ·          ·
+ └── scan  1  scan    ·         ·                      (a, b, c)  ·
+·          1  ·       table     t@primary              ·          ·
+·          1  ·       spans     ALL                    ·          ·
+
+exec
+SELECT LENGTH(s)::float, s FROM t.str
+----
+column3:float  s:string
+1.0            a
+2.0            ab
+3.0            abc
+
+exec-explain
+SELECT COALESCE(a, b) FROM (VALUES (1, 2), (3, NULL), (NULL, 4), (NULL, NULL)) AS v(a, b)
+----
+render       0  render  ·              ·                           (column3)           ·
+ │           0  ·       render 0       COALESCE(column1, column2)  ·                   ·
+ └── values  1  values  ·              ·                           (column1, column2)  ·
+·            1  ·       size           2 columns, 4 rows           ·                   ·
+·            1  ·       row 0, expr 0  1                           ·                   ·
+·            1  ·       row 0, expr 1  2                           ·                   ·
+·            1  ·       row 1, expr 0  3                           ·                   ·
+·            1  ·       row 1, expr 1  NULL                        ·                   ·
+·            1  ·       row 2, expr 0  NULL                        ·                   ·
+·            1  ·       row 2, expr 1  4                           ·                   ·
+·            1  ·       row 3, expr 0  NULL                        ·                   ·
+·            1  ·       row 3, expr 1  NULL                        ·                   ·
+
+exec
+SELECT COALESCE(a, b) FROM (VALUES (1, 2), (3, NULL), (NULL, 4), (NULL, NULL)) AS v(a, b)
+----
+column3:int
+1
+3
+4
+NULL
+
+exec-explain
+SELECT COALESCE(a, b, c) FROM (VALUES (1, 2, 3), (NULL, 4, 5), (NULL, NULL, 6), (NULL, NULL, NULL)) AS v(a, b, c)
+----
+render       0  render  ·              ·                                    (column4)                    ·
+ │           0  ·       render 0       COALESCE(column1, column2, column3)  ·                            ·
+ └── values  1  values  ·              ·                                    (column1, column2, column3)  ·
+·            1  ·       size           3 columns, 4 rows                    ·                            ·
+·            1  ·       row 0, expr 0  1                                    ·                            ·
+·            1  ·       row 0, expr 1  2                                    ·                            ·
+·            1  ·       row 0, expr 2  3                                    ·                            ·
+·            1  ·       row 1, expr 0  NULL                                 ·                            ·
+·            1  ·       row 1, expr 1  4                                    ·                            ·
+·            1  ·       row 1, expr 2  5                                    ·                            ·
+·            1  ·       row 2, expr 0  NULL                                 ·                            ·
+·            1  ·       row 2, expr 1  NULL                                 ·                            ·
+·            1  ·       row 2, expr 2  6                                    ·                            ·
+·            1  ·       row 3, expr 0  NULL                                 ·                            ·
+·            1  ·       row 3, expr 1  NULL                                 ·                            ·
+·            1  ·       row 3, expr 2  NULL                                 ·                            ·
+
+exec
+SELECT COALESCE(a, b, c) FROM (VALUES (1, 2, 3), (NULL, 4, 5), (NULL, NULL, 6), (NULL, NULL, NULL)) AS v(a, b, c)
+----
+column4:int
+1
+4
+6
+NULL
+
+exec-explain
+SELECT a FROM t.t WHERE a BETWEEN b AND d
+----
+render          0  render  ·         ·                      (a)        ·
+ │              0  ·       render 0  a                      ·          ·
+ └── filter     1  filter  ·         ·                      (a, b, d)  ·
+      │         1  ·       filter    (a >= b) AND (a <= d)  ·          ·
+      └── scan  2  scan    ·         ·                      (a, b, d)  ·
+·               2  ·       table     t@primary              ·          ·
+·               2  ·       spans     ALL                    ·          ·
+
+exec-explain
+SELECT a FROM t.t WHERE a NOT BETWEEN b AND d
+----
+render          0  render  ·         ·                   (a)        ·
+ │              0  ·       render 0  a                   ·          ·
+ └── filter     1  filter  ·         ·                   (a, b, d)  ·
+      │         1  ·       filter    (a < b) OR (a > d)  ·          ·
+      └── scan  2  scan    ·         ·                   (a, b, d)  ·
+·               2  ·       table     t@primary           ·          ·
+·               2  ·       spans     ALL                 ·          ·
+
+exec-explain
+SELECT a BETWEEN SYMMETRIC b AND d FROM t.t
+----
+render     0  render  ·         ·                                                   (column8)  ·
+ │         0  ·       render 0  ((a >= b) AND (a <= d)) OR ((a >= d) AND (a <= b))  ·          ·
+ └── scan  1  scan    ·         ·                                                   (a, b, d)  ·
+·          1  ·       table     t@primary                                           ·          ·
+·          1  ·       spans     ALL                                                 ·          ·
+
+exec-explain
+SELECT a NOT BETWEEN SYMMETRIC b AND d FROM t.t
+----
+render     0  render  ·         ·                                              (column8)  ·
+ │         0  ·       render 0  ((a < b) OR (a > d)) AND ((a < d) OR (a > b))  ·          ·
+ └── scan  1  scan    ·         ·                                              (a, b, d)  ·
+·          1  ·       table     t@primary                                      ·          ·
+·          1  ·       spans     ALL                                            ·          ·
+
+exec-explain
+SELECT ARRAY[a + 1, 2, 3] FROM t.t
+----
+render     0  render  ·         ·                   (column8)  ·
+ │         0  ·       render 0  ARRAY[a + 1, 2, 3]  ·          ·
+ └── scan  1  scan    ·         ·                   (a)        ·
+·          1  ·       table     t@primary           ·          ·
+·          1  ·       spans     ALL                 ·          ·

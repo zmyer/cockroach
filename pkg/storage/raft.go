@@ -12,23 +12,18 @@
 // implied. See the License for the specific language governing
 // permissions and limitations under the License. See the AUTHORS file
 // for names of contributors.
-//
-// Author: Ben Darnell
 
 package storage
 
 import (
 	"bytes"
+	"context"
 	"fmt"
 
-	"golang.org/x/net/context"
-
 	"github.com/cockroachdb/cockroach/pkg/security"
-	"github.com/cockroachdb/cockroach/pkg/storage/storagebase"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/coreos/etcd/raft"
 	"github.com/coreos/etcd/raft/raftpb"
-	"github.com/gogo/protobuf/proto"
 )
 
 // init installs an adapter to use clog for log messages from raft which
@@ -177,23 +172,8 @@ func raftEntryFormatter(data []byte) string {
 	if len(data) == 0 {
 		return "[empty]"
 	}
-	commandID, encodedCmd := DecodeRaftCommand(data)
-	if len(data) >= 1024 {
-		// Don't try to unmarshal and stringify the command if it is large. Doing
-		// so is super expensive (multiple seconds for the call to String()) for
-		// large snapshot entries.
-		return fmt.Sprintf("[%x] [%d]", commandID, len(data))
-	}
-	var cmd storagebase.RaftCommand
-	if err := proto.Unmarshal(encodedCmd, &cmd); err != nil {
-		return fmt.Sprintf("[error parsing entry: %s]", err)
-	}
-	s := cmd.BatchRequest.String()
-	maxLen := 300
-	if len(s) > maxLen {
-		s = s[:maxLen]
-	}
-	return fmt.Sprintf("[%x] %s", commandID, s)
+	commandID, _ := DecodeRaftCommand(data)
+	return fmt.Sprintf("[%x] [%d]", commandID, len(data))
 }
 
 var _ security.RequestWithUser = &RaftMessageRequest{}

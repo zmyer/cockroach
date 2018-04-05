@@ -11,12 +11,12 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
 // implied. See the License for the specific language governing
 // permissions and limitations under the License.
-//
-// Author: Radu Berinde (radu@cockroachlabs.com)
 
 package distsqlrun
 
 import (
+	"fmt"
+
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
 	"github.com/cockroachdb/cockroach/pkg/util/encoding"
 )
@@ -39,10 +39,26 @@ func convertToColumnOrdering(specOrdering Ordering) sqlbase.ColumnOrdering {
 // convertToSpecOrdering converts a sqlbase.ColumnOrdering type
 // to an Ordering type (as defined in data.proto).
 func convertToSpecOrdering(columnOrdering sqlbase.ColumnOrdering) Ordering {
+	return ConvertToMappedSpecOrdering(columnOrdering, nil)
+}
+
+// ConvertToMappedSpecOrdering converts a sqlbase.ColumnOrdering type
+// to an Ordering type (as defined in data.proto), using the column
+// indices contained in planToStreamColMap.
+func ConvertToMappedSpecOrdering(
+	columnOrdering sqlbase.ColumnOrdering, planToStreamColMap []int,
+) Ordering {
 	specOrdering := Ordering{}
 	specOrdering.Columns = make([]Ordering_Column, len(columnOrdering))
 	for i, c := range columnOrdering {
-		specOrdering.Columns[i].ColIdx = uint32(c.ColIdx)
+		colIdx := c.ColIdx
+		if planToStreamColMap != nil {
+			colIdx = planToStreamColMap[c.ColIdx]
+			if colIdx == -1 {
+				panic(fmt.Sprintf("column %d in sort ordering not available", c.ColIdx))
+			}
+		}
+		specOrdering.Columns[i].ColIdx = uint32(colIdx)
 		if c.Direction == encoding.Ascending {
 			specOrdering.Columns[i].Direction = Ordering_Column_ASC
 		} else {

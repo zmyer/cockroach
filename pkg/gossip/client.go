@@ -11,12 +11,11 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
 // implied. See the License for the specific language governing
 // permissions and limitations under the License.
-//
-// Author: Spencer Kimball (spencer.kimball@gmail.com)
 
 package gossip
 
 import (
+	"context"
 	"fmt"
 	"net"
 	"sync"
@@ -24,7 +23,6 @@ import (
 
 	"github.com/pkg/errors"
 	circuit "github.com/rubyist/circuitbreaker"
-	"golang.org/x/net/context"
 
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/rpc"
@@ -41,6 +39,7 @@ type client struct {
 
 	createdAt             time.Time
 	peerID                roachpb.NodeID           // Peer node ID; 0 until first gossip response
+	resolvedPlaceholder   bool                     // Whether we've resolved the nodeSet's placeholder for this client
 	addr                  net.Addr                 // Peer node network address
 	forwardAddr           *util.UnresolvedAddr     // Set if disconnected with an alternate addr
 	remoteHighWaterStamps map[roachpb.NodeID]int64 // Remote server's high water timestamps
@@ -74,15 +73,20 @@ func newClient(ambient log.AmbientContext, addr net.Addr, nodeMetrics Metrics) *
 // start dials the remote addr and commences gossip once connected. Upon exit,
 // the client is sent on the disconnected channel. This method starts client
 // processing in a goroutine and returns immediately.
-func (c *client) start(
+func (c *client) startLocked(
 	g *Gossip,
 	disconnected chan *client,
 	rpcCtx *rpc.Context,
 	stopper *stop.Stopper,
 	breaker *circuit.Breaker,
 ) {
-	stopper.RunWorker(func() {
-		ctx, cancel := context.WithCancel(c.AnnotateCtx(context.Background()))
+	// Add a placeholder for the new outgoing connection because we may not know
+	// the ID of the node we're connecting to yet. This will be resolved in
+	// (*client).handleResponse once we know the ID.
+	g.outgoing.addPlaceholder()
+
+	ctx, cancel := context.WithCancel(c.AnnotateCtx(context.Background()))
+	stopper.RunWorker(ctx, func(ctx context.Context) {
 		var wg sync.WaitGroup
 		defer func() {
 			// This closes the outgoing stream, causing any attempt to send or
@@ -106,7 +110,7 @@ func (c *client) start(
 			// asynchronous from the caller's perspective, so the only effect of
 			// `WithBlock` here is blocking shutdown - at the time of this writing,
 			// that ends ups up making `kv` tests take twice as long.
-			conn, err := rpcCtx.GRPCDial(c.addr.String())
+			conn, err := rpcCtx.GRPCDial(c.addr.String()).Connect(ctx)
 			if err != nil {
 				return err
 			}
@@ -155,6 +159,7 @@ func (c *client) requestGossip(g *Gossip, stream Gossip_GossipClient) error {
 		NodeID:          g.NodeID.Get(),
 		Addr:            g.mu.is.NodeAddr,
 		HighWaterStamps: g.mu.is.getHighWaterStamps(),
+		ClusterID:       g.clusterID.Get(),
 	}
 	g.mu.Unlock()
 
@@ -175,6 +180,7 @@ func (c *client) sendGossip(g *Gossip, stream Gossip_GossipClient) error {
 			Addr:            g.mu.is.NodeAddr,
 			Delta:           delta,
 			HighWaterStamps: g.mu.is.getHighWaterStamps(),
+			ClusterID:       g.clusterID.Get(),
 		}
 
 		bytesSent := int64(args.Size())
@@ -227,8 +233,16 @@ func (c *client) handleResponse(ctx context.Context, g *Gossip, reply *Response)
 		g.maybeTightenLocked()
 	}
 	c.peerID = reply.NodeID
-	g.outgoing.addNode(c.peerID)
 	c.remoteHighWaterStamps = reply.HighWaterStamps
+
+	// If we haven't yet recorded which node ID we're connected to in the outgoing
+	// nodeSet, do so now. Note that we only want to do this if the peer has a
+	// node ID allocated (i.e. if it's nonzero), because otherwise it could change
+	// after we record it.
+	if !c.resolvedPlaceholder && c.peerID != 0 {
+		c.resolvedPlaceholder = true
+		g.outgoing.resolvePlaceholder(c.peerID)
+	}
 
 	// Handle remote forwarding.
 	if reply.AlternateAddr != nil {
@@ -289,7 +303,7 @@ func (c *client) gossip(
 	// This wait group is used to allow the caller to wait until gossip
 	// processing is terminated.
 	wg.Add(1)
-	stopper.RunWorker(func() {
+	stopper.RunWorker(ctx, func(ctx context.Context) {
 		defer wg.Done()
 
 		errCh <- func() error {

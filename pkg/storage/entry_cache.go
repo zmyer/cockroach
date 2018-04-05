@@ -12,17 +12,16 @@
 // implied. See the License for the specific language governing
 // permissions and limitations under the License. See the AUTHORS file
 // for names of contributors.
-//
-// Author: Spencer Kimball (spencer@cockroachlabs.com)
 
 package storage
 
 import (
 	"github.com/biogo/store/llrb"
+	"github.com/coreos/etcd/raft/raftpb"
+
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/util/cache"
 	"github.com/cockroachdb/cockroach/pkg/util/syncutil"
-	"github.com/coreos/etcd/raft/raftpb"
 )
 
 type entryCacheKey struct {
@@ -32,8 +31,8 @@ type entryCacheKey struct {
 
 // Compare implements the llrb.Comparable interface for entryCacheKey, so that
 // it can be used as a key for util.OrderedCache.
-func (a entryCacheKey) Compare(b llrb.Comparable) int {
-	bk := b.(entryCacheKey)
+func (a *entryCacheKey) Compare(b llrb.Comparable) int {
+	bk := b.(*entryCacheKey)
 	switch {
 	case a.RangeID < bk.RangeID:
 		return -1
@@ -48,14 +47,18 @@ func (a entryCacheKey) Compare(b llrb.Comparable) int {
 	}
 }
 
-// A raftEntryCache maintains a global cache of Raft group log
-// entries. The cache mostly prevents unnecessary reads from disk of
-// recently-written log entries between log append and application
-// to the FSM.
+// A raftEntryCache maintains a global cache of Raft group log entries. The
+// cache mostly prevents unnecessary reads from disk of recently-written log
+// entries between log append and application to the FSM.
+//
+// This cache stores entries with sideloaded proposals inlined (i.e. ready to
+// be sent to followers).
 type raftEntryCache struct {
-	syncutil.RWMutex                     // protects Cache for concurrent access.
-	bytes            uint64              // total size of the cache in bytes
-	cache            *cache.OrderedCache // LRU cache of log entries, keyed by rangeID / log index
+	syncutil.Mutex                     // protects Cache for concurrent access.
+	bytes          uint64              // total size of the cache in bytes
+	cache          *cache.OrderedCache // LRU cache of log entries, keyed by rangeID / log index
+	fromKey        entryCacheKey       // used to avoid allocations on lookup
+	toKey          entryCacheKey       // ^^^
 }
 
 // newRaftEntryCache returns a new RaftEntryCache with the given
@@ -75,11 +78,25 @@ func newRaftEntryCache(maxBytes uint64) *raftEntryCache {
 		return rec.bytes > maxBytes && n >= 1
 	}
 	rec.cache.Config.OnEvicted = func(k, v interface{}) {
-		ent := v.(raftpb.Entry)
+		ent := v.(*raftpb.Entry)
 		rec.bytes -= uint64(ent.Size())
 	}
 
 	return rec
+}
+
+func (rec *raftEntryCache) makeCacheEntry(key entryCacheKey, value raftpb.Entry) *cache.Entry {
+	alloc := struct {
+		key   entryCacheKey
+		value raftpb.Entry
+		entry cache.Entry
+	}{
+		key:   key,
+		value: value,
+	}
+	alloc.entry.Key = &alloc.key
+	alloc.entry.Value = &alloc.value
+	return &alloc.entry
 }
 
 // addEntries adds the slice of raft entries, using the range ID and the
@@ -93,8 +110,28 @@ func (rec *raftEntryCache) addEntries(rangeID roachpb.RangeID, ents []raftpb.Ent
 
 	for _, e := range ents {
 		rec.bytes += uint64(e.Size())
-		rec.cache.Add(entryCacheKey{RangeID: rangeID, Index: e.Index}, e)
+		entry := rec.makeCacheEntry(entryCacheKey{RangeID: rangeID, Index: e.Index}, e)
+		rec.cache.AddEntry(entry)
 	}
+}
+
+// getTerm returns the term for the specified index and true for the second
+// return value. If the index is not present in the cache, false is returned.
+func (rec *raftEntryCache) getTerm(rangeID roachpb.RangeID, index uint64) (uint64, bool) {
+	rec.Lock()
+	defer rec.Unlock()
+
+	rec.fromKey = entryCacheKey{RangeID: rangeID, Index: index}
+	k, v, ok := rec.cache.Ceil(&rec.fromKey)
+	if !ok {
+		return 0, false
+	}
+	ecKey := k.(*entryCacheKey)
+	if ecKey.RangeID != rangeID || ecKey.Index != index {
+		return 0, false
+	}
+	ent := v.(*raftpb.Entry)
+	return ent.Term, true
 }
 
 // getEntries returns entries between [lo, hi) for specified range.
@@ -107,26 +144,25 @@ func (rec *raftEntryCache) getEntries(
 ) ([]raftpb.Entry, uint64, uint64) {
 	rec.Lock()
 	defer rec.Unlock()
-	var ent raftpb.Entry
 	var bytes uint64
 	nextIndex := lo
 
-	fromKey := entryCacheKey{RangeID: rangeID, Index: lo}
-	toKey := entryCacheKey{RangeID: rangeID, Index: hi}
+	rec.fromKey = entryCacheKey{RangeID: rangeID, Index: lo}
+	rec.toKey = entryCacheKey{RangeID: rangeID, Index: hi}
 	rec.cache.DoRange(func(k, v interface{}) bool {
-		ecKey := k.(entryCacheKey)
+		ecKey := k.(*entryCacheKey)
 		if ecKey.Index != nextIndex {
 			return true
 		}
-		ent = v.(raftpb.Entry)
-		ents = append(ents, ent)
+		ent := v.(*raftpb.Entry)
+		ents = append(ents, *ent)
 		bytes += uint64(ent.Size())
 		nextIndex++
 		if maxBytes > 0 && bytes > maxBytes {
 			return true
 		}
 		return false
-	}, fromKey, toKey)
+	}, &rec.fromKey, &rec.toKey)
 
 	return ents, bytes, nextIndex
 }
@@ -138,18 +174,17 @@ func (rec *raftEntryCache) delEntries(rangeID roachpb.RangeID, lo, hi uint64) {
 	if lo >= hi {
 		return
 	}
-	var keys []entryCacheKey
-	fromKey := entryCacheKey{RangeID: rangeID, Index: lo}
-	toKey := entryCacheKey{RangeID: rangeID, Index: hi}
-	rec.cache.DoRange(func(k, v interface{}) bool {
-		keys = append(keys, k.(entryCacheKey))
+	var cacheEnts []*cache.Entry
+	rec.fromKey = entryCacheKey{RangeID: rangeID, Index: lo}
+	rec.toKey = entryCacheKey{RangeID: rangeID, Index: hi}
+	rec.cache.DoRangeEntry(func(e *cache.Entry) bool {
+		cacheEnts = append(cacheEnts, e)
 		return false
-	}, fromKey, toKey)
+	}, &rec.fromKey, &rec.toKey)
 
-	for _, k := range keys {
-		rec.cache.Del(k)
+	for _, e := range cacheEnts {
+		rec.cache.DelEntry(e)
 	}
-	return
 }
 
 // clearTo clears the entries in the cache for specified range up to,

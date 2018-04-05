@@ -11,44 +11,48 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
 // implied. See the License for the specific language governing
 // permissions and limitations under the License.
-//
-// Author: Vivek Menezes (vivek@cockroachlabs.com)
 
 package storage
 
 import (
+	"context"
 	"time"
-
-	"golang.org/x/net/context"
 
 	"github.com/cockroachdb/cockroach/pkg/config"
 	"github.com/cockroachdb/cockroach/pkg/gossip"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
+	"github.com/cockroachdb/cockroach/pkg/settings"
+	"github.com/cockroachdb/cockroach/pkg/util/grpcutil"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 )
 
-const (
-	consistencyQueueSize = 100
+var consistencyCheckInterval = settings.RegisterNonNegativeDurationSetting(
+	"server.consistency_check.interval",
+	"the time between range consistency checks; set to 0 to disable consistency checking",
+	24*time.Hour,
 )
 
 type consistencyQueue struct {
 	*baseQueue
-	interval       time.Duration
+	interval       func() time.Duration
 	replicaCountFn func() int
 }
 
 // newConsistencyQueue returns a new instance of consistencyQueue.
 func newConsistencyQueue(store *Store, gossip *gossip.Gossip) *consistencyQueue {
 	q := &consistencyQueue{
-		interval:       store.cfg.ConsistencyCheckInterval,
+		interval: func() time.Duration {
+			return consistencyCheckInterval.Get(&store.ClusterSettings().SV)
+		},
 		replicaCountFn: store.ReplicaCount,
 	}
 	q.baseQueue = newBaseQueue(
 		"replica consistency checker", q, store, gossip,
 		queueConfig{
-			maxSize:              consistencyQueueSize,
+			maxSize:              defaultQueueMaxSize,
 			needsLease:           true,
+			needsSystemConfig:    false,
 			acceptsUnsplitRanges: true,
 			successes:            store.metrics.ConsistencyQueueSuccesses,
 			failures:             store.metrics.ConsistencyQueueFailures,
@@ -62,13 +66,18 @@ func newConsistencyQueue(store *Store, gossip *gossip.Gossip) *consistencyQueue 
 func (q *consistencyQueue) shouldQueue(
 	ctx context.Context, now hlc.Timestamp, repl *Replica, _ config.SystemConfig,
 ) (bool, float64) {
+	interval := q.interval()
+	if interval <= 0 {
+		return false, 0
+	}
+
 	shouldQ, priority := true, float64(0)
 	if !repl.store.cfg.TestingKnobs.DisableLastProcessedCheck {
 		lpTS, err := repl.getQueueLastProcessed(ctx, q.name)
 		if err != nil {
-			log.ErrEventf(ctx, "consistency queue last processed timestamp: %s", err)
+			return false, 0
 		}
-		if shouldQ, priority = shouldQueueAgain(now, lpTS, q.interval); !shouldQ {
+		if shouldQ, priority = shouldQueueAgain(now, lpTS, interval); !shouldQ {
 			return false, 0
 		}
 	}
@@ -76,7 +85,7 @@ func (q *consistencyQueue) shouldQueue(
 	if repl.store.cfg.NodeLiveness != nil {
 		for _, rep := range repl.Desc().Replicas {
 			if live, err := repl.store.cfg.NodeLiveness.IsLive(rep.NodeID); err != nil {
-				log.ErrEventf(ctx, "node %d liveness failed: %s", rep.NodeID, err)
+				log.VErrEventf(ctx, 3, "node %d liveness failed: %s", rep.NodeID, err)
 				return false, 0
 			} else if !live {
 				return false, 0
@@ -87,14 +96,24 @@ func (q *consistencyQueue) shouldQueue(
 }
 
 // process() is called on every range for which this node is a lease holder.
-func (q *consistencyQueue) process(ctx context.Context, repl *Replica, _ config.SystemConfig) error {
+func (q *consistencyQueue) process(
+	ctx context.Context, repl *Replica, _ config.SystemConfig,
+) error {
+	if q.interval() <= 0 {
+		return nil
+	}
 	req := roachpb.CheckConsistencyRequest{}
 	if _, pErr := repl.CheckConsistency(ctx, req); pErr != nil {
-		log.Error(ctx, pErr.GoError())
+		_, shouldQuiesce := <-repl.store.Stopper().ShouldQuiesce()
+		if !shouldQuiesce || !grpcutil.IsClosedConnection(pErr.GoError()) {
+			// Suppress noisy errors about closed GRPC connections when the
+			// server is quiescing.
+			log.Error(ctx, pErr.GoError())
+		}
 	}
 	// Update the last processed time for this queue.
 	if err := repl.setQueueLastProcessed(ctx, q.name, repl.store.Clock().Now()); err != nil {
-		log.ErrEventf(ctx, "failed to update last processed time: %v", err)
+		log.VErrEventf(ctx, 2, "failed to update last processed time: %v", err)
 	}
 	return nil
 }
@@ -106,7 +125,7 @@ func (q *consistencyQueue) timer(duration time.Duration) time.Duration {
 	if replicaCount == 0 {
 		return 0
 	}
-	replInterval := q.interval / time.Duration(replicaCount)
+	replInterval := q.interval() / time.Duration(replicaCount)
 	if replInterval < duration {
 		return 0
 	}

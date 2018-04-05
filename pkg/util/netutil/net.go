@@ -11,12 +11,11 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
 // implied. See the License for the specific language governing
 // permissions and limitations under the License.
-//
-// Author: Tamir Duberstein (tamird@gmail.com)
 
 package netutil
 
 import (
+	"context"
 	"crypto/tls"
 	"io"
 	"net"
@@ -26,7 +25,6 @@ import (
 
 	"google.golang.org/grpc"
 
-	"golang.org/x/net/context"
 	"golang.org/x/net/http2"
 
 	"github.com/cockroachdb/cmux"
@@ -36,7 +34,7 @@ import (
 )
 
 // ListenAndServeGRPC creates a listener and serves the specified grpc Server
-// on it, closing the listener when signalled by the stopper.
+// on it, closing the listener when signaled by the stopper.
 func ListenAndServeGRPC(
 	stopper *stop.Stopper, server *grpc.Server, addr net.Addr,
 ) (net.Listener, error) {
@@ -45,14 +43,16 @@ func ListenAndServeGRPC(
 		return ln, err
 	}
 
-	stopper.RunWorker(func() {
+	ctx := context.TODO()
+
+	stopper.RunWorker(ctx, func(context.Context) {
 		<-stopper.ShouldQuiesce()
 		FatalIfUnexpected(ln.Close())
 		<-stopper.ShouldStop()
 		server.Stop()
 	})
 
-	stopper.RunWorker(func() {
+	stopper.RunWorker(ctx, func(context.Context) {
 		FatalIfUnexpected(server.Serve(ln))
 	})
 	return ln, nil
@@ -66,7 +66,7 @@ type Server struct {
 }
 
 // MakeServer constructs a Server that tracks active connections, closing them
-// when signalled by stopper.
+// when signaled by stopper.
 func MakeServer(stopper *stop.Stopper, tlsConfig *tls.Config, handler http.Handler) Server {
 	var mu syncutil.Mutex
 	activeConns := make(map[net.Conn]struct{})
@@ -88,13 +88,15 @@ func MakeServer(stopper *stop.Stopper, tlsConfig *tls.Config, handler http.Handl
 		},
 	}
 
+	ctx := context.TODO()
+
 	// net/http.(*Server).Serve/http2.ConfigureServer are not thread safe with
 	// respect to net/http.(*Server).TLSConfig, so we call it synchronously here.
 	if err := http2.ConfigureServer(server.Server, nil); err != nil {
-		log.Fatal(context.TODO(), err)
+		log.Fatal(ctx, err)
 	}
 
-	stopper.RunWorker(func() {
+	stopper.RunWorker(ctx, func(context.Context) {
 		<-stopper.ShouldStop()
 
 		mu.Lock()
@@ -108,7 +110,9 @@ func MakeServer(stopper *stop.Stopper, tlsConfig *tls.Config, handler http.Handl
 }
 
 // ServeWith accepts connections on ln and serves them using serveConn.
-func (s *Server) ServeWith(stopper *stop.Stopper, l net.Listener, serveConn func(net.Conn)) error {
+func (s *Server) ServeWith(
+	ctx context.Context, stopper *stop.Stopper, l net.Listener, serveConn func(net.Conn),
+) error {
 	// Inspired by net/http.(*Server).Serve
 	var tempDelay time.Duration // how long to sleep on accept failure
 	for {
@@ -131,7 +135,7 @@ func (s *Server) ServeWith(stopper *stop.Stopper, l net.Listener, serveConn func
 		}
 		tempDelay = 0
 		go func() {
-			defer stopper.Recover()
+			defer stopper.Recover(ctx)
 			s.Server.ConnState(rw, http.StateNew) // before Serve can return
 			serveConn(rw)
 			s.Server.ConnState(rw, http.StateClosed)

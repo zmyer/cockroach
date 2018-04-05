@@ -11,12 +11,11 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
 // implied. See the License for the specific language governing
 // permissions and limitations under the License.
-//
-// Author: Spencer Kimball (spencer.kimball@gmail.com)
 
 package gossip
 
 import (
+	"context"
 	"fmt"
 	"math"
 	"reflect"
@@ -24,8 +23,6 @@ import (
 	"sync"
 	"testing"
 	"time"
-
-	"golang.org/x/net/context"
 
 	"github.com/cockroachdb/cockroach/pkg/base"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
@@ -35,6 +32,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/metric"
 	"github.com/cockroachdb/cockroach/pkg/util/stop"
 	"github.com/cockroachdb/cockroach/pkg/util/syncutil"
+	"github.com/cockroachdb/cockroach/pkg/util/tracing"
 	"github.com/gogo/protobuf/proto"
 )
 
@@ -44,7 +42,7 @@ func newTestInfoStore() (*infoStore, *stop.Stopper) {
 	stopper := stop.NewStopper()
 	nc := &base.NodeIDContainer{}
 	nc.Set(context.TODO(), 1)
-	is := newInfoStore(log.AmbientContext{}, nc, emptyAddr, stopper)
+	is := newInfoStore(log.AmbientContext{Tracer: tracing.NewTracer()}, nc, emptyAddr, stopper)
 	return is, stopper
 }
 
@@ -53,7 +51,7 @@ func newTestInfoStore() (*infoStore, *stop.Stopper) {
 func TestZeroDuration(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	is, stopper := newTestInfoStore()
-	defer stopper.Stop()
+	defer stopper.Stop(context.TODO())
 	info := is.newInfo(nil, 0)
 	if info.TTLStamp != math.MaxInt64 {
 		t.Errorf("expected zero duration to get max TTLStamp: %d", info.TTLStamp)
@@ -64,7 +62,7 @@ func TestZeroDuration(t *testing.T) {
 func TestNewInfo(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	is, stopper := newTestInfoStore()
-	defer stopper.Stop()
+	defer stopper.Stop(context.TODO())
 	info1 := is.newInfo(nil, time.Second)
 	info2 := is.newInfo(nil, time.Second)
 	if err := is.addInfo("a", info1); err != nil {
@@ -83,7 +81,7 @@ func TestNewInfo(t *testing.T) {
 func TestInfoStoreGetInfo(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	is, stopper := newTestInfoStore()
-	defer stopper.Stop()
+	defer stopper.Stop(context.TODO())
 	i := is.newInfo(nil, time.Second)
 	i.NodeID = 1
 	if err := is.addInfo("a", i); err != nil {
@@ -107,14 +105,14 @@ func TestInfoStoreGetInfo(t *testing.T) {
 func TestInfoStoreGetInfoTTL(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	is, stopper := newTestInfoStore()
-	defer stopper.Stop()
+	defer stopper.Stop(context.TODO())
 	i := is.newInfo(nil, time.Nanosecond)
 	if err := is.addInfo("a", i); err != nil {
 		t.Error(err)
 	}
 	time.Sleep(time.Nanosecond)
-	if is.getInfo("a") != nil {
-		t.Error("shouldn't be able to get info with short TTL")
+	if info := is.getInfo("a"); info != nil {
+		t.Errorf("shouldn't be able to get info with short TTL, got %+v", info)
 	}
 }
 
@@ -123,7 +121,7 @@ func TestInfoStoreGetInfoTTL(t *testing.T) {
 func TestAddInfoSameKeyLessThanEqualTimestamp(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	is, stopper := newTestInfoStore()
-	defer stopper.Stop()
+	defer stopper.Stop(context.TODO())
 	info1 := is.newInfo(nil, time.Second)
 	if err := is.addInfo("a", info1); err != nil {
 		t.Error(err)
@@ -147,7 +145,7 @@ func TestAddInfoSameKeyLessThanEqualTimestamp(t *testing.T) {
 func TestAddInfoSameKeyGreaterTimestamp(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	is, stopper := newTestInfoStore()
-	defer stopper.Stop()
+	defer stopper.Stop(context.TODO())
 	info1 := is.newInfo(nil, time.Second)
 	info2 := is.newInfo(nil, time.Second)
 	if err1, err2 := is.addInfo("a", info1), is.addInfo("a", info2); err1 != nil || err2 != nil {
@@ -160,7 +158,7 @@ func TestAddInfoSameKeyGreaterTimestamp(t *testing.T) {
 func TestAddInfoSameKeyDifferentHops(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	is, stopper := newTestInfoStore()
-	defer stopper.Stop()
+	defer stopper.Stop(context.TODO())
 	info1 := is.newInfo(nil, time.Second)
 	info1.Hops = 1
 	info2 := is.newInfo(nil, time.Second)
@@ -192,7 +190,7 @@ func TestAddInfoSameKeyDifferentHops(t *testing.T) {
 // Helper method creates an infostore with 10 infos.
 func createTestInfoStore(t *testing.T) *infoStore {
 	is, stopper := newTestInfoStore()
-	defer stopper.Stop()
+	defer stopper.Stop(context.TODO())
 
 	for i := 0; i < 10; i++ {
 		infoA := is.newInfo(nil, time.Second)
@@ -268,22 +266,48 @@ func TestInfoStoreMostDistant(t *testing.T) {
 		roachpb.NodeID(3),
 	}
 	is, stopper := newTestInfoStore()
-	defer stopper.Stop()
+	defer stopper.Stop(context.TODO())
+
+	// Start with one very distant info that shouldn't affect mostDistant
+	// calculations because it isn't a node ID key.
+	scInfo := is.newInfo(nil, time.Second)
+	scInfo.Hops = 100
+	scInfo.NodeID = nodes[0]
+	if err := is.addInfo(KeySystemConfig, scInfo); err != nil {
+		t.Fatal(err)
+	}
+
 	// Add info from each address, with hop count equal to index+1.
 	for i := 0; i < len(nodes); i++ {
 		inf := is.newInfo(nil, time.Second)
 		inf.Hops = uint32(i + 1)
 		inf.NodeID = nodes[i]
-		if err := is.addInfo(fmt.Sprintf("b.%d", i), inf); err != nil {
+		if err := is.addInfo(MakeNodeIDKey(inf.NodeID), inf); err != nil {
 			t.Fatal(err)
 		}
-		nodeID, hops := is.mostDistant()
+		nodeID, hops := is.mostDistant(func(roachpb.NodeID) bool { return false })
 		if nodeID != inf.NodeID {
 			t.Errorf("%d: expected node %d; got %d", i, inf.NodeID, nodeID)
 		}
 		if hops != inf.Hops {
 			t.Errorf("%d: expected node %d; got %d", i, inf.Hops, hops)
 		}
+	}
+
+	// Finally, simulate a Gossip instance that has an outgoing connection
+	// and expect the outgoing connection to not be recommended even though
+	// it's the furthest node away.
+	filteredNode := nodes[len(nodes)-1]
+	expectedNode := nodes[len(nodes)-2]
+	expectedHops := expectedNode
+	nodeID, hops := is.mostDistant(func(nodeID roachpb.NodeID) bool {
+		return nodeID == filteredNode
+	})
+	if nodeID != expectedNode {
+		t.Errorf("expected node %d; got %d", expectedNode, nodeID)
+	}
+	if hops != uint32(expectedHops) {
+		t.Errorf("expected node %d; got %d", expectedHops, hops)
 	}
 }
 
@@ -296,7 +320,7 @@ func TestLeastUseful(t *testing.T) {
 		roachpb.NodeID(2),
 	}
 	is, stopper := newTestInfoStore()
-	defer stopper.Stop()
+	defer stopper.Stop(context.TODO())
 
 	set := makeNodeSet(3, metric.NewGauge(metric.Metadata{Name: ""}))
 	if is.leastUseful(set) != 0 {
@@ -366,7 +390,7 @@ func (cr *callbackRecord) Keys() []string {
 func TestCallbacks(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	is, stopper := newTestInfoStore()
-	defer stopper.Stop()
+	defer stopper.Stop(context.TODO())
 	wg := &sync.WaitGroup{}
 	cb1 := callbackRecord{wg: wg}
 	cb2 := callbackRecord{wg: wg}
@@ -472,7 +496,7 @@ func TestCallbacks(t *testing.T) {
 func TestRegisterCallback(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	is, stopper := newTestInfoStore()
-	defer stopper.Stop()
+	defer stopper.Stop(context.TODO())
 	wg := &sync.WaitGroup{}
 	cb := callbackRecord{wg: wg}
 

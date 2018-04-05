@@ -11,17 +11,16 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
 // implied. See the License for the specific language governing
 // permissions and limitations under the License.
-//
-// Author: Spencer Kimball (spencer.kimball@gmail.com)
 
 package retry
 
 import (
+	"context"
 	"math"
 	"math/rand"
 	"time"
 
-	"golang.org/x/net/context"
+	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 )
 
 // Options provides reusable configuration of Retry objects.
@@ -46,7 +45,7 @@ type Retry struct {
 // Start returns a new Retry initialized to some default values. The Retry can
 // then be used in an exponential-backoff retry loop.
 func Start(opts Options) Retry {
-	return StartWithCtx(nil, opts)
+	return StartWithCtx(context.Background(), opts)
 }
 
 // StartWithCtx returns a new Retry initialized to some default values. The
@@ -67,9 +66,7 @@ func StartWithCtx(ctx context.Context, opts Options) Retry {
 	}
 
 	r := Retry{opts: opts}
-	if ctx != nil {
-		r.ctxDoneChan = ctx.Done()
-	}
+	r.ctxDoneChan = ctx.Done()
 	r.Reset()
 	return r
 }
@@ -90,12 +87,6 @@ func (r *Retry) Reset() {
 	}
 	r.currentAttempt = 0
 	r.isReset = true
-}
-
-// CurrentAttempt it is zero initially and increases with each call to Next()
-// which does not immediately follow a Reset().
-func (r *Retry) CurrentAttempt() int {
-	return r.currentAttempt
 }
 
 func (r Retry) retryIn() time.Duration {
@@ -120,7 +111,7 @@ func (r *Retry) Next() bool {
 		return true
 	}
 
-	if r.opts.MaxRetries > 0 && r.currentAttempt == r.opts.MaxRetries {
+	if r.opts.MaxRetries > 0 && r.currentAttempt >= r.opts.MaxRetries {
 		return false
 	}
 
@@ -134,4 +125,59 @@ func (r *Retry) Next() bool {
 	case <-r.ctxDoneChan:
 		return false
 	}
+}
+
+// closedC is returned from Retry.NextCh whenever a retry
+// can begin immediately.
+var closedC = func() chan time.Time {
+	c := make(chan time.Time)
+	close(c)
+	return c
+}()
+
+// NextCh returns a channel which will receive when the next retry
+// interval has expired.
+func (r *Retry) NextCh() <-chan time.Time {
+	if r.isReset {
+		r.isReset = false
+		return closedC
+	}
+	r.currentAttempt++
+	if r.opts.MaxRetries > 0 && r.currentAttempt > r.opts.MaxRetries {
+		return nil
+	}
+	return time.After(r.retryIn())
+}
+
+// WithMaxAttempts is a helper that runs fn N times and collects the last err.
+func WithMaxAttempts(ctx context.Context, opts Options, n int, fn func() error) error {
+	opts.MaxRetries = n - 1
+	var err error
+	for r := StartWithCtx(ctx, opts); r.Next(); {
+		err = fn()
+		if err == nil {
+			return nil
+		}
+	}
+	return err
+}
+
+// ForDuration will retry the given function until it either returns
+// without error, or the given duration has elapsed. The function is invoked
+// immediately at first and then successively with an exponential backoff
+// starting at 1ns and ending at the specified duration.
+func ForDuration(duration time.Duration, fn func() error) error {
+	deadline := timeutil.Now().Add(duration)
+	var lastErr error
+	for wait := time.Duration(1); timeutil.Now().Before(deadline); wait *= 2 {
+		lastErr = fn()
+		if lastErr == nil {
+			return nil
+		}
+		if wait > time.Second {
+			wait = time.Second
+		}
+		time.Sleep(wait)
+	}
+	return lastErr
 }

@@ -11,22 +11,17 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
 // implied. See the License for the specific language governing
 // permissions and limitations under the License.
-//
-// Author: Matt Jibson (mjibson@cockroachlabs.com)
 
 package cli
 
 import (
+	"io/ioutil"
 	"net/url"
-	"strings"
+	"os"
 	"testing"
 
-	"github.com/chzyer/readline"
-	"github.com/cockroachdb/cockroach/pkg/base"
 	"github.com/cockroachdb/cockroach/pkg/security"
-	"github.com/cockroachdb/cockroach/pkg/server"
-	"github.com/cockroachdb/cockroach/pkg/sql/parser"
-	"github.com/cockroachdb/cockroach/pkg/testutils/serverutils"
+	"github.com/cockroachdb/cockroach/pkg/testutils/sqlutils"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 )
 
@@ -34,13 +29,12 @@ import (
 func TestSQLLex(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 
-	s, _, _ := serverutils.StartServer(t, base.TestServerArgs{Insecure: true})
-	defer s.Stopper().Stop()
+	c := newCLITest(cliTestParams{t: t})
+	defer c.cleanup()
 
-	pgurl, err := s.(*server.TestServer).Cfg.PGURL(url.User(security.RootUser))
-	if err != nil {
-		t.Fatal(err)
-	}
+	pgurl, cleanup := sqlutils.PGUrl(t, c.ServingAddr(), t.Name(), url.User(security.RootUser))
+	defer cleanup()
+
 	conn := makeSQLConn(pgurl.String())
 	defer conn.Close()
 
@@ -58,9 +52,13 @@ select '
 			expect: `+---------------+
 | e'\n\\?\n;\n' |
 +---------------+
-| ␤             |
-| \?␤           |
-| ;␤            |
+|               |
+|               |
+| \?            |
+|               |
+| ;             |
+|               |
+|               |
 +---------------+
 (1 row)
 `,
@@ -70,9 +68,7 @@ select '
 select ''''
 ;
 
-set syntax = modern;
-
-select ''''
+select '''
 ;
 ''';
 `,
@@ -82,13 +78,15 @@ select ''''
 | '     |
 +-------+
 (1 row)
-SET
-+------------+
-| e'\'\n;\n' |
-+------------+
-| '␤         |
-| ;␤         |
-+------------+
++--------------+
+| e'\'\n;\n\'' |
++--------------+
+| '            |
+|              |
+| ;            |
+|              |
+| '            |
++--------------+
 (1 row)
 `,
 		},
@@ -105,18 +103,47 @@ SET
 		},
 	}
 
-	conf := readline.Config{
-		DisableAutoSaveHistory: true,
-		FuncOnWidthChanged:     func(func()) {},
-	}
+	setCLIDefaultsForTests()
 
-	// Some other tests (TestDumpRow) mess with this, so make sure it's set.
-	cliCtx.prettyFmt = true
+	// We need a temporary file with a name guaranteed to be available.
+	// So open a dummy file.
+	f, err := ioutil.TempFile("", "input")
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Get the name and close it.
+	fname := f.Name()
+	f.Close()
+
+	// At every point below, when t.Fatal is called we should ensure the
+	// file is closed and removed.
+	f = nil
+	defer func() {
+		if f != nil {
+			f.Close()
+		}
+		_ = os.Remove(fname)
+		stdin = os.Stdin
+	}()
 
 	for _, test := range tests {
-		conf.Stdin = strings.NewReader(test.in)
+		// Populate the test input.
+		if f, err = os.OpenFile(fname, os.O_WRONLY, 0666); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := f.WriteString(test.in); err != nil {
+			t.Fatal(err)
+		}
+		f.Close()
+		// Make it available for reading.
+		if f, err = os.Open(fname); err != nil {
+			t.Fatal(err)
+		}
+		// Override the standard input for runInteractive().
+		stdin = f
+
 		out, err := captureOutput(func() {
-			err := runInteractive(conn, &conf)
+			err := runInteractive(conn)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -134,11 +161,9 @@ func TestIsEndOfStatement(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 
 	tests := []struct {
-		syntax  parser.Syntax
 		in      string
 		isEnd   bool
 		isEmpty bool
-		hasSet  bool
 	}{
 		{
 			in:    ";",
@@ -155,18 +180,12 @@ func TestIsEndOfStatement(t *testing.T) {
 			in: "SELECT",
 		},
 		{
-			in:     "SET; SELECT 1;",
-			isEnd:  true,
-			hasSet: true,
+			in:    "SET; SELECT 1;",
+			isEnd: true,
 		},
 		{
-			in:     "SELECT ''''; SET;",
-			isEnd:  true,
-			hasSet: true,
-		},
-		{
-			in:     "SELECT ''''; SET;",
-			syntax: parser.Modern,
+			in:    "SELECT ''''; SET;",
+			isEnd: true,
 		},
 		{
 			in:      "  -- hello",
@@ -175,19 +194,13 @@ func TestIsEndOfStatement(t *testing.T) {
 	}
 
 	for _, test := range tests {
-		syntax := test.syntax
-		if syntax == 0 {
-			syntax = parser.Traditional
-		}
-		isEmpty, isEnd, hasSet := isEndOfStatement(test.in, syntax)
+		isEmpty, lastTok := checkTokens(test.in)
 		if isEmpty != test.isEmpty {
 			t.Errorf("%q: isEmpty expected %v, got %v", test.in, test.isEmpty, isEmpty)
 		}
+		isEnd := isEndOfStatement(lastTok)
 		if isEnd != test.isEnd {
 			t.Errorf("%q: isEnd expected %v, got %v", test.in, test.isEnd, isEnd)
-		}
-		if hasSet != test.hasSet {
-			t.Errorf("%q: hasSet expected %v, got %v", test.in, test.hasSet, hasSet)
 		}
 	}
 }

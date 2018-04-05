@@ -11,39 +11,46 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
 // implied. See the License for the specific language governing
 // permissions and limitations under the License.
-//
-// Author: Bram Gruneir (bram+code@cockroachlabs.com)
 
 package storage
 
 import (
+	"context"
 	"sort"
 	"time"
 
 	"github.com/coreos/etcd/raft"
 	"github.com/pkg/errors"
-	"golang.org/x/net/context"
 
 	"github.com/cockroachdb/cockroach/pkg/config"
 	"github.com/cockroachdb/cockroach/pkg/gossip"
 	"github.com/cockroachdb/cockroach/pkg/internal/client"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
+	"github.com/cockroachdb/cockroach/pkg/util/envutil"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 )
 
 const (
-	// raftLogQueueMaxSize is the max size of the queue.
-	raftLogQueueMaxSize = 100
-	// RaftLogQueueTimerDuration is the duration between truncations. This needs
-	// to be relatively short so that truncations can keep up with raft log entry
-	// creation.
-	RaftLogQueueTimerDuration = 50 * time.Millisecond
+	// raftLogQueueTimerDuration is the duration between truncations.
+	raftLogQueueTimerDuration = 0 // zero duration to process truncations greedily
 	// RaftLogQueueStaleThreshold is the minimum threshold for stale raft log
 	// entries. A stale entry is one which all replicas of the range have
 	// progressed past and thus is no longer needed and can be truncated.
 	RaftLogQueueStaleThreshold = 100
+	// RaftLogQueueStaleSize is the minimum size of the Raft log that we'll
+	// truncate even if there are fewer than RaftLogQueueStaleThreshold entries
+	// to truncate. The value of 64 KB was chosen experimentally by looking at
+	// when Raft log truncation usually occurs when using the number of entries
+	// as the sole criteria.
+	RaftLogQueueStaleSize = 64 << 10
+	// Allow a limited number of Raft log truncations to be processed
+	// concurrently.
+	raftLogQueueConcurrency = 4
 )
+
+// raftLogMaxSize limits the maximum size of the Raft log.
+var raftLogMaxSize = envutil.EnvOrDefaultInt64("COCKROACH_RAFT_LOG_MAX_SIZE", 4<<20 /* 4 MB */)
 
 // raftLogQueue manages a queue of replicas slated to have their raft logs
 // truncated by removing unneeded entries.
@@ -60,8 +67,10 @@ func newRaftLogQueue(store *Store, db *client.DB, gossip *gossip.Gossip) *raftLo
 	rlq.baseQueue = newBaseQueue(
 		"raftlog", rlq, store, gossip,
 		queueConfig{
-			maxSize:              raftLogQueueMaxSize,
+			maxSize:              defaultQueueMaxSize,
+			maxConcurrency:       raftLogQueueConcurrency,
 			needsLease:           false,
+			needsSystemConfig:    false,
 			acceptsUnsplitRanges: true,
 			successes:            store.metrics.RaftLogQueueSuccesses,
 			failures:             store.metrics.RaftLogQueueFailures,
@@ -72,23 +81,28 @@ func newRaftLogQueue(store *Store, db *client.DB, gossip *gossip.Gossip) *raftLo
 	return rlq
 }
 
-// getTruncatableIndexes returns the number of truncatable indexes and the
-// oldest index that cannot be truncated for the replica.
-// See computeTruncatableIndex.
-func getTruncatableIndexes(ctx context.Context, r *Replica) (uint64, uint64, error) {
+func shouldTruncate(truncatableIndexes uint64, raftLogSize int64) bool {
+	return truncatableIndexes >= RaftLogQueueStaleThreshold ||
+		(truncatableIndexes > 0 && raftLogSize >= RaftLogQueueStaleSize)
+}
+
+// getTruncatableIndexes returns the number of truncatable indexes, the oldest
+// index that cannot be truncated, and the current Raft log size. See
+// computeTruncatableIndex.
+func getTruncatableIndexes(ctx context.Context, r *Replica) (uint64, uint64, int64, error) {
 	rangeID := r.RangeID
 	raftStatus := r.RaftStatus()
 	if raftStatus == nil {
 		if log.V(6) {
-			log.Infof(ctx, "the raft group doesn't exist for range %d", rangeID)
+			log.Infof(ctx, "the raft group doesn't exist for r%d", rangeID)
 		}
-		return 0, 0, nil
+		return 0, 0, 0, nil
 	}
 
 	// Is this the raft leader? We only perform log truncation on the raft leader
 	// which has the up to date info on followers.
 	if raftStatus.RaftState != raft.StateLeader {
-		return 0, 0, nil
+		return 0, 0, 0, nil
 	}
 
 	r.mu.Lock()
@@ -104,17 +118,21 @@ func getTruncatableIndexes(ctx context.Context, r *Replica) (uint64, uint64, err
 	if targetSize > r.mu.maxBytes {
 		targetSize = r.mu.maxBytes
 	}
-	firstIndex, err := r.FirstIndex()
+	if targetSize > raftLogMaxSize {
+		targetSize = raftLogMaxSize
+	}
+	firstIndex, err := r.raftFirstIndexLocked()
 	pendingSnapshotIndex := r.mu.pendingSnapshotIndex
+	lastIndex := r.mu.lastIndex
 	r.mu.Unlock()
 	if err != nil {
-		return 0, 0, errors.Errorf("error retrieving first index for range %d: %s", rangeID, err)
+		return 0, 0, 0, errors.Errorf("error retrieving first index for r%d: %s", rangeID, err)
 	}
 
 	truncatableIndex := computeTruncatableIndex(
-		raftStatus, raftLogSize, targetSize, firstIndex, pendingSnapshotIndex)
+		raftStatus, raftLogSize, targetSize, firstIndex, lastIndex, pendingSnapshotIndex)
 	// Return the number of truncatable indexes.
-	return truncatableIndex - firstIndex, truncatableIndex, nil
+	return truncatableIndex - firstIndex, truncatableIndex, raftLogSize, nil
 }
 
 // computeTruncatableIndex returns the oldest index that cannot be
@@ -135,7 +153,12 @@ func getTruncatableIndexes(ctx context.Context, r *Replica) (uint64, uint64, err
 // and thus require another snapshot, likely entering a never ending loop of
 // snapshots. See #8629.
 func computeTruncatableIndex(
-	raftStatus *raft.Status, raftLogSize, targetSize int64, firstIndex, pendingSnapshotIndex uint64,
+	raftStatus *raft.Status,
+	raftLogSize int64,
+	targetSize int64,
+	firstIndex uint64,
+	lastIndex uint64,
+	pendingSnapshotIndex uint64,
 ) uint64 {
 	quorumIndex := getQuorumIndex(raftStatus, pendingSnapshotIndex)
 	truncatableIndex := quorumIndex
@@ -167,13 +190,28 @@ func computeTruncatableIndex(
 	if truncatableIndex > quorumIndex {
 		truncatableIndex = quorumIndex
 	}
+	// Never truncate past the last index. Naively, you would expect lastIndex to
+	// never be smaller than quorumIndex, but RaftStatus.Progress.Match is
+	// updated on the leader when a command is proposed and in a single replica
+	// Raft group this also means that RaftStatus.Commit is updated at propose
+	// time.
+	if truncatableIndex > lastIndex {
+		truncatableIndex = lastIndex
+	}
 	return truncatableIndex
 }
 
 // getQuorumIndex returns the index which a quorum of the nodes have
 // committed. The pendingSnapshotIndex indicates the index of a pending
 // snapshot which is considered part of the Raft group even though it hasn't
-// been added yet.
+// been added yet. Note that getQuorumIndex may return 0 if the progress map
+// doesn't contain information for a sufficient number of followers (e.g. the
+// local replica has only recently become the leader). In general, the value
+// returned by getQuorumIndex may be smaller than raftStatus.Commit which is
+// the log index that has been committed by a quorum of replicas where that
+// quorum was determined at the time the index was written. If you're thinking
+// of using getQuorumIndex for some purpose, consider that raftStatus.Commit
+// might be more appropriate (e.g. determining if a replica is up to date).
 func getQuorumIndex(raftStatus *raft.Status, pendingSnapshotIndex uint64) uint64 {
 	match := make([]uint64, 0, len(raftStatus.Progress)+1)
 	for _, progress := range raftStatus.Progress {
@@ -193,46 +231,51 @@ func getQuorumIndex(raftStatus *raft.Status, pendingSnapshotIndex uint64) uint64
 func (rlq *raftLogQueue) shouldQueue(
 	ctx context.Context, now hlc.Timestamp, r *Replica, _ config.SystemConfig,
 ) (shouldQ bool, priority float64) {
-	truncatableIndexes, _, err := getTruncatableIndexes(ctx, r)
+	truncatableIndexes, _, raftLogSize, err := getTruncatableIndexes(ctx, r)
 	if err != nil {
 		log.Warning(ctx, err)
 		return false, 0
 	}
 
-	return truncatableIndexes >= RaftLogQueueStaleThreshold, float64(truncatableIndexes)
+	return shouldTruncate(truncatableIndexes, raftLogSize), float64(raftLogSize)
 }
 
 // process truncates the raft log of the range if the replica is the raft
 // leader and if the total number of the range's raft log's stale entries
 // exceeds RaftLogQueueStaleThreshold.
 func (rlq *raftLogQueue) process(ctx context.Context, r *Replica, _ config.SystemConfig) error {
-	truncatableIndexes, oldestIndex, err := getTruncatableIndexes(ctx, r)
+	truncatableIndexes, oldestIndex, raftLogSize, err := getTruncatableIndexes(ctx, r)
 	if err != nil {
 		return err
 	}
 
 	// Can and should the raft logs be truncated?
-	if truncatableIndexes >= RaftLogQueueStaleThreshold {
+	if shouldTruncate(truncatableIndexes, raftLogSize) {
 		r.mu.Lock()
 		raftLogSize := r.mu.raftLogSize
 		r.mu.Unlock()
 
-		log.VEventf(ctx, 1, "truncating raft log %d-%d: size=%d",
-			oldestIndex-truncatableIndexes, oldestIndex, raftLogSize)
+		if log.V(1) {
+			log.Infof(ctx, "truncating raft log %d-%d: size=%d",
+				oldestIndex-truncatableIndexes, oldestIndex, raftLogSize)
+		}
 		b := &client.Batch{}
 		b.AddRawRequest(&roachpb.TruncateLogRequest{
 			Span:    roachpb.Span{Key: r.Desc().StartKey.AsRawKey()},
 			Index:   oldestIndex,
 			RangeID: r.RangeID,
 		})
-		return rlq.db.Run(ctx, b)
+		if err := rlq.db.Run(ctx, b); err != nil {
+			return err
+		}
+		r.store.metrics.RaftLogTruncated.Inc(int64(truncatableIndexes))
 	}
 	return nil
 }
 
 // timer returns interval between processing successive queued truncations.
 func (*raftLogQueue) timer(_ time.Duration) time.Duration {
-	return RaftLogQueueTimerDuration
+	return raftLogQueueTimerDuration
 }
 
 // purgatoryChan returns nil.

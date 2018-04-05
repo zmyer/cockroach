@@ -11,27 +11,28 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
 // implied. See the License for the specific language governing
 // permissions and limitations under the License.
-//
-// Author: Bram Gruneir (bram+code@cockroachlabs.com)
 
 package base
 
 import (
 	"bytes"
 	"fmt"
+	"path/filepath"
+	"regexp"
 	"sort"
 	"strconv"
 	"strings"
-	"unicode"
 
 	"github.com/dustin/go-humanize"
+	"github.com/pkg/errors"
 	"github.com/spf13/pflag"
 
+	"github.com/cockroachdb/cockroach/pkg/cli/cliflags"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/util/humanizeutil"
 )
 
-// This file implements method receivers for members of server.Context struct
+// This file implements method receivers for members of server.Config struct
 // -- 'Stores' and 'JoinList', which satisfies pflag's value interface
 
 // MinimumStoreSize is the smallest size in bytes that a store can have. This
@@ -40,14 +41,41 @@ import (
 // hard coded to 640MiB.
 const MinimumStoreSize = 10 * 64 << 20
 
+// GetAbsoluteStorePath takes a (possibly relative) and returns the absolute path.
+// Returns an error if the path begins with '~' or Abs fails.
+// 'fieldName' is used in error strings.
+func GetAbsoluteStorePath(fieldName string, p string) (string, error) {
+	if p[0] == '~' {
+		return "", fmt.Errorf("%s cannot start with '~': %s", fieldName, p)
+	}
+
+	ret, err := filepath.Abs(p)
+	if err != nil {
+		return "", errors.Wrapf(err, "could not find absolute path for %s %s", fieldName, p)
+	}
+	return ret, nil
+}
+
 // StoreSpec contains the details that can be specified in the cli pertaining
 // to the --store flag.
 type StoreSpec struct {
-	Path        string
+	Path string
+	// SizeInBytes is used for calculating free space and making rebalancing
+	// decisions. Zero indicates that there is no maximum size. This value is not
+	// actually used by the engine and thus not enforced.
 	SizeInBytes int64
 	SizePercent float64
 	InMemory    bool
 	Attributes  roachpb.Attributes
+	// UseSwitchingEnv is true if the "switching env" store version is desired.
+	// This is set by CCL code when encryption-at-rest is in use.
+	UseSwitchingEnv bool
+	// RocksDBOptions contains RocksDB specific options using a semicolon
+	// separated key-value syntax ("key1=value1; key2=value2").
+	RocksDBOptions string
+	// ExtraOptions is a serialized protobuf set by Go CCL code and passed through
+	// to C CCL code.
+	ExtraOptions []byte
 }
 
 // String returns a fully parsable version of the store spec.
@@ -82,7 +110,21 @@ func (ss StoreSpec) String() string {
 	return buffer.String()
 }
 
-// newStoreSpec parses the string passed into a --store flag and returns a
+// fractionRegex is the regular expression that recognizes whether
+// the specified size is a fraction of the total available space.
+// Proportional sizes can be expressed as fractional numbers, either
+// in absolute value or with a trailing "%" sign. A fractional number
+// without a trailing "%" must be recognized by the presence of a
+// decimal separator; numbers without decimal separators are plain
+// sizes in bytes (separate case in the parsing).
+// The first part of the regexp matches NNN.[MMM]; the second part
+// [NNN].MMM, and the last part matches explicit percentages with or
+// without a decimal separator.
+// Values smaller than 1% and 100% are rejected after parsing using
+// a separate check.
+var fractionRegex = regexp.MustCompile(`^([0-9]+\.[0-9]*|[0-9]*\.[0-9]+|[0-9]+(\.[0-9]*)?%)$`)
+
+// NewStoreSpec parses the string passed into a --store flag and returns a
 // StoreSpec if it is correctly parsed.
 // There are four possible fields that can be passed in, comma separated:
 // - path=xxx The directory in which to the rocks db instance should be
@@ -99,7 +141,8 @@ func (ss StoreSpec) String() string {
 //   - 0.2             -> 20% of the available space
 // - attrs=xxx:yyy:zzz A colon separated list of optional attributes.
 // Note that commas are forbidden within any field name or value.
-func newStoreSpec(value string) (StoreSpec, error) {
+func NewStoreSpec(value string) (StoreSpec, error) {
+	const pathField = "path"
 	if len(value) == 0 {
 		return StoreSpec{}, fmt.Errorf("no value specified")
 	}
@@ -113,7 +156,7 @@ func newStoreSpec(value string) (StoreSpec, error) {
 		var field string
 		var value string
 		if len(subSplits) == 1 {
-			field = "path"
+			field = pathField
 			value = subSplits[0]
 		} else {
 			field = strings.ToLower(subSplits[0])
@@ -132,32 +175,23 @@ func newStoreSpec(value string) (StoreSpec, error) {
 		}
 
 		switch field {
-		case "path":
-			if len(value) == 0 {
-
+		case pathField:
+			var err error
+			ss.Path, err = GetAbsoluteStorePath(pathField, value)
+			if err != nil {
+				return StoreSpec{}, err
 			}
-			ss.Path = value
 		case "size":
-			if len(value) == 0 {
-				return StoreSpec{}, fmt.Errorf("no size specified")
-			}
-
-			if unicode.IsDigit(rune(value[len(value)-1])) &&
-				(strings.HasPrefix(value, "0.") || strings.HasPrefix(value, ".")) {
-				// Value is a percentage without % sign.
-				var err error
-				ss.SizePercent, err = strconv.ParseFloat(value, 64)
-				ss.SizePercent *= 100
-				if err != nil {
-					return StoreSpec{}, fmt.Errorf("could not parse store size (%s) %s", value, err)
+			if fractionRegex.MatchString(value) {
+				percentFactor := 100.0
+				factorValue := value
+				if value[len(value)-1] == '%' {
+					percentFactor = 1.0
+					factorValue = value[:len(value)-1]
 				}
-				if ss.SizePercent > 100 || ss.SizePercent < 1 {
-					return StoreSpec{}, fmt.Errorf("store size (%s) must be between 1%% and 100%%", value)
-				}
-			} else if strings.HasSuffix(value, "%") {
-				// Value is a percentage.
 				var err error
-				ss.SizePercent, err = strconv.ParseFloat(value[:len(value)-1], 64)
+				ss.SizePercent, err = strconv.ParseFloat(factorValue, 64)
+				ss.SizePercent *= percentFactor
 				if err != nil {
 					return StoreSpec{}, fmt.Errorf("could not parse store size (%s) %s", value, err)
 				}
@@ -176,9 +210,6 @@ func newStoreSpec(value string) (StoreSpec, error) {
 				}
 			}
 		case "attrs":
-			if len(value) == 0 {
-				return StoreSpec{}, fmt.Errorf("no attributes specified")
-			}
 			// Check to make sure there are no duplicate attributes.
 			attrMap := make(map[string]struct{})
 			for _, attribute := range strings.Split(value, ":") {
@@ -197,6 +228,8 @@ func newStoreSpec(value string) (StoreSpec, error) {
 			} else {
 				return StoreSpec{}, fmt.Errorf("%s is not a valid store type", value)
 			}
+		case "rocksdb":
+			ss.RocksDBOptions = value
 		default:
 			return StoreSpec{}, fmt.Errorf("%s is not a valid store field", field)
 		}
@@ -229,7 +262,7 @@ var _ pflag.Value = &StoreSpecList{}
 func (ssl StoreSpecList) String() string {
 	var buffer bytes.Buffer
 	for _, ss := range ssl.Specs {
-		fmt.Fprintf(&buffer, "--store=%s ", ss)
+		fmt.Fprintf(&buffer, "--%s=%s ", cliflags.Store.Name, ss)
 	}
 	// Trim the extra space from the end if it exists.
 	if l := buffer.Len(); l > 0 {
@@ -247,7 +280,7 @@ func (ssl *StoreSpecList) Type() string {
 // Set adds a new value to the StoreSpecValue. It is the important part of
 // pflag's value interface.
 func (ssl *StoreSpecList) Set(value string) error {
-	spec, err := newStoreSpec(value)
+	spec, err := NewStoreSpec(value)
 	if err != nil {
 		return err
 	}

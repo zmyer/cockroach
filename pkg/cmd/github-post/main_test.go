@@ -11,12 +11,11 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
 // implied. See the License for the specific language governing
 // permissions and limitations under the License.
-//
-// Author: Tamir Duberstein (tamird@gmail.com)
 
 package main
 
 import (
+	"context"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -30,16 +29,18 @@ import (
 
 func TestRunGH(t *testing.T) {
 	const (
-		expOwner      = "cockroachdb"
-		expRepo       = "cockroach"
-		envPkg        = "foo/bar/baz"
-		envPropEvalKV = "true"
-		envTags       = "deadlock"
-		envGoFlags    = "race"
-		sha           = "abcd123"
-		serverURL     = "https://teamcity.example.com"
-		buildID       = 8008135
-		issueID       = 1337
+		expOwner     = "cockroachdb"
+		expRepo      = "cockroach"
+		expAssignee  = "hodor"
+		expMilestone = 2
+		envPkg       = "storage"
+		envTags      = "deadlock"
+		envGoFlags   = "race"
+		sha          = "abcd123"
+		serverURL    = "https://teamcity.example.com"
+		buildID      = 8008135
+		issueID      = 1337
+		issueNumber  = 30
 	)
 
 	for key, value := range map[string]string{
@@ -47,10 +48,9 @@ func TestRunGH(t *testing.T) {
 		teamcityServerURLEnv: serverURL,
 		teamcityBuildIDEnv:   strconv.Itoa(buildID),
 
-		pkgEnv:        envPkg,
-		propEvalKVEnv: envPropEvalKV,
-		tagsEnv:       envTags,
-		goFlagsEnv:    envGoFlags,
+		pkgEnv:     cockroachPkgPrefix + envPkg,
+		tagsEnv:    envTags,
+		goFlagsEnv: envGoFlags,
 	} {
 		if val, ok := os.LookupEnv(key); ok {
 			defer func() {
@@ -72,7 +72,6 @@ func TestRunGH(t *testing.T) {
 	}
 
 	parameters := "```\n" + strings.Join([]string{
-		propEvalKVEnv + "=" + envPropEvalKV,
 		tagsEnv + "=" + envTags,
 		goFlagsEnv + "=" + envGoFlags,
 	}, "\n") + "\n```"
@@ -89,47 +88,59 @@ func TestRunGH(t *testing.T) {
 		},
 		"stress-fatal": {
 			packageName: envPkg,
-			testName:    "TestRaftRemoveRace",
-			body:        "F161007 00:27:33.243126 449 storage/store.go:2446  [s3] [n3,s3,r1:/M{in-ax}]: could not remove placeholder after preemptive snapshot",
+			testName:    "TestGossipHandlesReplacedNode",
+			body:        "F170517 07:33:43.763059 69575 storage/replica.go:1360  [n3,s3,r1/3:/M{in-ax}] on-disk and in-memory state diverged:",
 		},
 	} {
-		t.Run(fileName, func(t *testing.T) {
-			file, err := os.Open(filepath.Join("testdata", fileName))
-			if err != nil {
-				t.Fatal(err)
+		for _, foundIssue := range []bool{true, false} {
+			testName := fileName
+			if foundIssue {
+				testName = testName + "-existing-issue"
 			}
+			t.Run(testName, func(t *testing.T) {
+				file, err := os.Open(filepath.Join("testdata", fileName))
+				if err != nil {
+					t.Fatal(err)
+				}
 
-			issueBodyRe, err := regexp.Compile(
-				fmt.Sprintf(`(?s)\ASHA: https://github.com/cockroachdb/cockroach/commits/%s
+				reString := fmt.Sprintf(`(?s)\ASHA: https://github.com/cockroachdb/cockroach/commits/%s
 
 Parameters:
 %s
 
-Stress build found a failed test: %s
-
-.*
-%s
-`,
+Stress build found a failed test: %s`,
 					regexp.QuoteMeta(sha),
 					regexp.QuoteMeta(parameters),
 					regexp.QuoteMeta(fmt.Sprintf("%s/viewLog.html?buildId=%d&tab=buildLog", serverURL, buildID)),
-					regexp.QuoteMeta(expectations.body),
-				),
-			)
-			if err != nil {
-				t.Fatal(err)
-			}
+				)
 
-			count := 0
-			if err := runGH(
-				file,
-				func(owner string, repo string, issue *github.IssueRequest) (*github.Issue, *github.Response, error) {
-					count++
+				issueBodyRe, err := regexp.Compile(
+					fmt.Sprintf(reString+`
+
+.*
+%s
+`, regexp.QuoteMeta(expectations.body)),
+				)
+				if err != nil {
+					t.Fatal(err)
+				}
+				commentBodyRe, err := regexp.Compile(reString)
+				if err != nil {
+					t.Fatal(err)
+				}
+
+				issueCount := 0
+				commentCount := 0
+				postIssue := func(_ context.Context, owner string, repo string, issue *github.IssueRequest) (*github.Issue, *github.Response, error) {
+					issueCount++
 					if owner != expOwner {
 						t.Fatalf("got %s, expected %s", owner, expOwner)
 					}
 					if repo != expRepo {
 						t.Fatalf("got %s, expected %s", repo, expRepo)
+					}
+					if *issue.Assignee != expAssignee {
+						t.Fatalf("got %s, expected %s", *issue.Assignee, expAssignee)
 					}
 					if expected := fmt.Sprintf("%s: %s failed under stress", expectations.packageName, expectations.testName); *issue.Title != expected {
 						t.Fatalf("got %s, expected %s", *issue.Title, expected)
@@ -140,14 +151,101 @@ Stress build found a failed test: %s
 					if length := len(*issue.Body); length > githubIssueBodyMaximumLength {
 						t.Fatalf("issue length %d exceeds (undocumented) maximum %d", length, githubIssueBodyMaximumLength)
 					}
-					return &github.Issue{ID: github.Int(issueID)}, nil, nil
-				},
-			); err != nil {
-				t.Fatal(err)
-			}
-			if expected := 1; count != expected {
-				t.Fatalf("%d issues were posted, expected %d", count, expected)
-			}
-		})
+					if *issue.Milestone != expMilestone {
+						t.Fatalf("expected milestone %d, but got %d", expMilestone, *issue.Milestone)
+					}
+					return &github.Issue{ID: github.Int64(issueID)}, nil, nil
+				}
+				searchIssues := func(_ context.Context, query string, opt *github.SearchOptions) (*github.IssuesSearchResult, *github.Response, error) {
+					total := 0
+					if foundIssue {
+						total = 1
+					}
+					return &github.IssuesSearchResult{
+						Total: &total,
+						Issues: []github.Issue{
+							{Number: github.Int(issueNumber)},
+						},
+					}, nil, nil
+				}
+				postComment := func(_ context.Context, owner string, repo string, number int, comment *github.IssueComment) (*github.IssueComment, *github.Response, error) {
+					if owner != expOwner {
+						t.Fatalf("got %s, expected %s", owner, expOwner)
+					}
+					if repo != expRepo {
+						t.Fatalf("got %s, expected %s", repo, expRepo)
+					}
+					if !commentBodyRe.MatchString(*comment.Body) {
+						t.Fatalf("got:\n%s\nexpected:\n%s", *comment.Body, issueBodyRe)
+					}
+					if length := len(*comment.Body); length > githubIssueBodyMaximumLength {
+						t.Fatalf("comment length %d exceeds (undocumented) maximum %d", length, githubIssueBodyMaximumLength)
+					}
+					commentCount++
+
+					return nil, nil, nil
+				}
+
+				listCommits := func(_ context.Context, owner string, repo string, opts *github.CommitsListOptions) ([]*github.RepositoryCommit, *github.Response, error) {
+					if owner != expOwner {
+						t.Fatalf("got %s, expected %s", owner, expOwner)
+					}
+					if repo != expRepo {
+						t.Fatalf("got %s, expected %s", repo, expRepo)
+					}
+					if opts.Author == "" {
+						t.Fatalf("found no author, but expected one")
+					}
+					assignee := expAssignee
+					return []*github.RepositoryCommit{
+						{
+							Author: &github.User{
+								Login: &assignee,
+							},
+						},
+					}, nil, nil
+				}
+
+				listMilestones := func(_ context.Context, owner, repo string, _ *github.MilestoneListOptions) ([]*github.Milestone, *github.Response, error) {
+					if owner != expOwner {
+						t.Fatalf("got %s, expected %s", owner, expOwner)
+					}
+					if repo != expRepo {
+						t.Fatalf("got %s, expected %s", repo, expRepo)
+					}
+					return []*github.Milestone{
+						{Title: github.String("3.3"), Number: github.Int(expMilestone)},
+						{Title: github.String("3.2"), Number: github.Int(1)},
+					}, nil, nil
+				}
+
+				getLatestTag := func() (string, error) { return "3.3", nil }
+
+				if err := runGH(
+					context.Background(),
+					file,
+					postIssue,
+					searchIssues,
+					postComment,
+					listCommits,
+					listMilestones,
+					getLatestTag,
+				); err != nil {
+					t.Fatal(err)
+				}
+				expectedIssues := 1
+				expectedComments := 0
+				if foundIssue {
+					expectedIssues = 0
+					expectedComments = 1
+				}
+				if issueCount != expectedIssues {
+					t.Fatalf("%d issues were posted, expected %d", issueCount, expectedIssues)
+				}
+				if commentCount != expectedComments {
+					t.Fatalf("%d comments were posted, expected %d", commentCount, expectedComments)
+				}
+			})
+		}
 	}
 }

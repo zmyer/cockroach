@@ -11,8 +11,6 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
 // implied. See the License for the specific language governing
 // permissions and limitations under the License.
-//
-// Author: Marc Berhault (marc@cockroachlabs.com)
 
 package security_test
 
@@ -26,7 +24,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/security"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
-	"github.com/gogo/protobuf/proto"
+	"github.com/cockroachdb/cockroach/pkg/util/protoutil"
 )
 
 // Construct a fake tls.ConnectionState object with one peer certificate
@@ -62,13 +60,15 @@ func TestGetCertificateUser(t *testing.T) {
 		t.Error("unexpected success")
 	}
 
-	// len(certs) != len(chains)
-	if _, err := security.GetCertificateUser(makeFakeTLSState([]string{"foo"}, []int{1, 1})); err == nil {
-		t.Error("unexpected success")
-	}
-
 	// Good request: single certificate.
 	if name, err := security.GetCertificateUser(makeFakeTLSState([]string{"foo"}, []int{2})); err != nil {
+		t.Error(err)
+	} else if name != "foo" {
+		t.Errorf("expected name: foo, got: %s", name)
+	}
+
+	// Request with multiple certs, but only one chain (eg: origin certs are client and CA).
+	if name, err := security.GetCertificateUser(makeFakeTLSState([]string{"foo", "CA"}, []int{2})); err != nil {
 		t.Error(err)
 	} else if name != "foo" {
 		t.Errorf("expected name: foo, got: %s", name)
@@ -91,7 +91,7 @@ func TestAuthenticationHook(t *testing.T) {
 	testCases := []struct {
 		insecure           bool
 		tls                *tls.ConnectionState
-		request            proto.Message
+		request            protoutil.Message
 		buildHookSuccess   bool
 		publicHookSuccess  bool
 		privateHookSuccess bool

@@ -11,87 +11,37 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
 // implied. See the License for the specific language governing
 // permissions and limitations under the License.
-//
-// Author: Marc Berhault (marc@cockroachlabs.com)
 
 package sql
 
 import (
+	"context"
 	"fmt"
 
-	"github.com/cockroachdb/cockroach/pkg/config"
+	"github.com/pkg/errors"
+
 	"github.com/cockroachdb/cockroach/pkg/internal/client"
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
-	"github.com/cockroachdb/cockroach/pkg/sql/parser"
-	"github.com/cockroachdb/cockroach/pkg/sql/privilege"
+	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
-	"github.com/pkg/errors"
 )
+
+//
+// This file contains routines for low-level access to stored
+// descriptors.
+//
+// For higher levels in the SQL layer, these interface are likely not
+// suitable; consider instead schema_accessors.go and resolver.go.
+//
 
 var (
-	errEmptyDatabaseName = errors.New("empty database name")
-	errNoDatabase        = errors.New("no database specified")
-	errNoTable           = errors.New("no table specified")
+	errEmptyDatabaseName = pgerror.NewError(pgerror.CodeSyntaxError, "empty database name")
+	errNoDatabase        = pgerror.NewError(pgerror.CodeInvalidNameError, "no database specified")
+	errNoTable           = pgerror.NewError(pgerror.CodeInvalidNameError, "no table specified")
+	errNoMatch           = pgerror.NewError(pgerror.CodeUndefinedObjectError, "no object matched")
 )
-
-// DescriptorAccessor provides helper methods for using descriptors
-// to SQL objects.
-type DescriptorAccessor interface {
-	// checkPrivilege verifies that p.session.User has `privilege` on `descriptor`.
-	checkPrivilege(descriptor sqlbase.DescriptorProto, privilege privilege.Kind) error
-
-	// anyPrivilege verifies that p.session.User has any privilege on `descriptor`.
-	anyPrivilege(descriptor sqlbase.DescriptorProto) error
-
-	// createDescriptor takes a Table or Database descriptor and creates it if
-	// needed, incrementing the descriptor counter. Returns true if the descriptor
-	// is actually created, false if it already existed, or an error if one was encountered.
-	// The ifNotExists flag is used to declare if the "already existed" state should be an
-	// error (false) or a no-op (true).
-	createDescriptor(plainKey sqlbase.DescriptorKey, descriptor sqlbase.DescriptorProto, ifNotExists bool) (bool, error)
-
-	// getDescriptor looks up the descriptor for `plainKey`, validates it,
-	// and unmarshals it into `descriptor`.
-	// If `plainKey` doesn't exist, returns false and nil error.
-	// In most cases you'll want to use wrappers: `getDatabaseDesc` or
-	// `getTableDesc`.
-	getDescriptor(plainKey sqlbase.DescriptorKey, descriptor sqlbase.DescriptorProto) (bool, error)
-
-	// getAllDescriptors looks up and returns all available descriptors.
-	getAllDescriptors() ([]sqlbase.DescriptorProto, error)
-
-	// getDescriptorsFromTargetList examines a TargetList and fetches the
-	// appropriate descriptors.
-	getDescriptorsFromTargetList(targets parser.TargetList) ([]sqlbase.DescriptorProto, error)
-}
-
-var _ DescriptorAccessor = &planner{}
-
-// checkPrivilege implements the DescriptorAccessor interface.
-func (p *planner) checkPrivilege(
-	descriptor sqlbase.DescriptorProto, privilege privilege.Kind,
-) error {
-	if descriptor.GetPrivileges().CheckPrivilege(p.session.User, privilege) {
-		return nil
-	}
-	return fmt.Errorf("user %s does not have %s privilege on %s %s",
-		p.session.User, privilege, descriptor.TypeName(), descriptor.GetName())
-}
-
-// anyPrivilege implements the DescriptorAccessor interface.
-func (p *planner) anyPrivilege(descriptor sqlbase.DescriptorProto) error {
-	if userCanSeeDescriptor(descriptor, p.session.User) {
-		return nil
-	}
-	return fmt.Errorf("user %s has no privileges on %s %s",
-		p.session.User, descriptor.TypeName(), descriptor.GetName())
-}
-
-func userCanSeeDescriptor(descriptor sqlbase.DescriptorProto, user string) bool {
-	return descriptor.GetPrivileges().AnyPrivilege(user) || isVirtualDescriptor(descriptor)
-}
 
 type descriptorAlreadyExistsErr struct {
 	desc sqlbase.DescriptorProto
@@ -103,23 +53,31 @@ func (d descriptorAlreadyExistsErr) Error() string {
 }
 
 // GenerateUniqueDescID returns the next available Descriptor ID and increments
-// the counter.
-func GenerateUniqueDescID(txn *client.Txn) (sqlbase.ID, error) {
+// the counter. The incrementing is non-transactional, and the counter could be
+// incremented multiple times because of retries.
+func GenerateUniqueDescID(ctx context.Context, db *client.DB) (sqlbase.ID, error) {
 	// Increment unique descriptor counter.
-	ir, err := txn.Inc(keys.DescIDGenerator, 1)
+	newVal, err := client.IncrementValRetryable(ctx, db, keys.DescIDGenerator, 1)
 	if err != nil {
 		return 0, err
 	}
-	return sqlbase.ID(ir.ValueInt() - 1), nil
+	return sqlbase.ID(newVal - 1), nil
 }
 
-// createDescriptor implements the DescriptorAccessor interface.
+// createDescriptor takes a Table or Database descriptor and creates it if
+// needed, incrementing the descriptor counter. Returns true if the descriptor
+// is actually created, false if it already existed, or an error if one was
+// encountered. The ifNotExists flag is used to declare if the "already existed"
+// state should be an error (false) or a no-op (true).
 func (p *planner) createDescriptor(
-	plainKey sqlbase.DescriptorKey, descriptor sqlbase.DescriptorProto, ifNotExists bool,
+	ctx context.Context,
+	plainKey sqlbase.DescriptorKey,
+	descriptor sqlbase.DescriptorProto,
+	ifNotExists bool,
 ) (bool, error) {
 	idKey := plainKey.Key()
 
-	if exists, err := p.descExists(idKey); err == nil && exists {
+	if exists, err := descExists(ctx, p.txn, idKey); err == nil && exists {
 		if ifNotExists {
 			// Noop.
 			return false, nil
@@ -137,17 +95,17 @@ func (p *planner) createDescriptor(
 		return false, err
 	}
 
-	id, err := GenerateUniqueDescID(p.txn)
+	id, err := GenerateUniqueDescID(ctx, p.ExecCfg().DB)
 	if err != nil {
 		return false, err
 	}
 
-	return true, p.createDescriptorWithID(idKey, id, descriptor)
+	return true, p.createDescriptorWithID(ctx, idKey, id, descriptor)
 }
 
-func (p *planner) descExists(idKey roachpb.Key) (bool, error) {
+func descExists(ctx context.Context, txn *client.Txn, idKey roachpb.Key) (bool, error) {
 	// Check whether idKey exists.
-	gr, err := p.txn.Get(idKey)
+	gr, err := txn.Get(ctx, idKey)
 	if err != nil {
 		return false, err
 	}
@@ -155,7 +113,7 @@ func (p *planner) descExists(idKey roachpb.Key) (bool, error) {
 }
 
 func (p *planner) createDescriptorWithID(
-	idKey roachpb.Key, id sqlbase.ID, descriptor sqlbase.DescriptorProto,
+	ctx context.Context, idKey roachpb.Key, id sqlbase.ID, descriptor sqlbase.DescriptorProto,
 ) error {
 	descriptor.SetID(id)
 	// TODO(pmattis): The error currently returned below is likely going to be
@@ -172,34 +130,33 @@ func (p *planner) createDescriptorWithID(
 	b := &client.Batch{}
 	descID := descriptor.GetID()
 	descDesc := sqlbase.WrapDescriptor(descriptor)
-	if log.V(2) {
-		log.Infof(p.ctx(), "CPut %s -> %d", idKey, descID)
-		log.Infof(p.ctx(), "CPut %s -> %s", descKey, descDesc)
+	if p.ExtendedEvalContext().Tracing.KVTracingEnabled() {
+		log.VEventf(ctx, 2, "CPut %s -> %d", idKey, descID)
+		log.VEventf(ctx, 2, "CPut %s -> %s", descKey, descDesc)
 	}
 	b.CPut(idKey, descID, nil)
 	b.CPut(descKey, descDesc, nil)
 
-	p.setTestingVerifyMetadata(func(systemConfig config.SystemConfig) error {
-		if err := expectDescriptorID(systemConfig, idKey, descID); err != nil {
-			return err
-		}
-		return expectDescriptor(systemConfig, descKey, descDesc)
-	})
+	if desc, ok := descriptor.(*sqlbase.TableDescriptor); ok {
+		p.Tables().addUncommittedTable(*desc)
+	}
 
-	return p.txn.Run(b)
+	return p.txn.Run(ctx, b)
 }
 
-// getDescriptor implements the DescriptorAccessor interface.
-func (p *planner) getDescriptor(
-	plainKey sqlbase.DescriptorKey, descriptor sqlbase.DescriptorProto,
-) (bool, error) {
-	return getDescriptor(p.txn, plainKey, descriptor)
-}
-
+// getDescriptor looks up the descriptor for `plainKey`, validates it,
+// and unmarshals it into `descriptor`.
+//
+// If `plainKey` doesn't exist, returns false and nil error.
+// In most cases you'll want to use wrappers: `getDatabaseDesc` or
+// `getTableDesc`.
 func getDescriptor(
-	txn *client.Txn, plainKey sqlbase.DescriptorKey, descriptor sqlbase.DescriptorProto,
+	ctx context.Context,
+	txn *client.Txn,
+	plainKey sqlbase.DescriptorKey,
+	descriptor sqlbase.DescriptorProto,
 ) (bool, error) {
-	gr, err := txn.Get(plainKey.Key())
+	gr, err := txn.Get(ctx, plainKey.Key())
 	if err != nil {
 		return false, err
 	}
@@ -207,45 +164,56 @@ func getDescriptor(
 		return false, nil
 	}
 
-	descKey := sqlbase.MakeDescMetadataKey(sqlbase.ID(gr.ValueInt()))
-	desc := &sqlbase.Descriptor{}
-	if err := txn.GetProto(descKey, desc); err != nil {
+	if err := getDescriptorByID(ctx, txn, sqlbase.ID(gr.ValueInt()), descriptor); err != nil {
 		return false, err
+	}
+	return true, nil
+}
+
+// getDescriptorByID looks up the descriptor for `id`, validates it,
+// and unmarshals it into `descriptor`.
+//
+// In most cases you'll want to use wrappers: `getDatabaseDescByID` or
+// `getTableDescByID`.
+func getDescriptorByID(
+	ctx context.Context, txn *client.Txn, id sqlbase.ID, descriptor sqlbase.DescriptorProto,
+) error {
+	descKey := sqlbase.MakeDescMetadataKey(id)
+	desc := &sqlbase.Descriptor{}
+	if err := txn.GetProto(ctx, descKey, desc); err != nil {
+		return err
 	}
 
 	switch t := descriptor.(type) {
 	case *sqlbase.TableDescriptor:
 		table := desc.GetTable()
 		if table == nil {
-			return false, errors.Errorf("%q is not a table", plainKey.Name())
+			return errors.Errorf("%q is not a table", desc.String())
 		}
-		table.MaybeUpgradeFormatVersion()
-		// TODO(dan): Write the upgraded TableDescriptor back to kv. This will break
-		// the ability to use a previous version of cockroach with the on-disk data,
-		// but it's worth it to avoid having to do the upgrade every time the
-		// descriptor is fetched. Our current test for this enforces compatibility
-		// backward and forward, so that'll have to be extended before this is done.
-		if err := table.Validate(txn); err != nil {
-			return false, err
+		table.MaybeFillInDescriptor()
+
+		if err := table.Validate(ctx, txn, nil /* clusterVersion */); err != nil {
+			return err
 		}
 		*t = *table
 	case *sqlbase.DatabaseDescriptor:
 		database := desc.GetDatabase()
 		if database == nil {
-			return false, errors.Errorf("%q is not a database", plainKey.Name())
+			return errors.Errorf("%q is not a database", desc.String())
 		}
+
 		if err := database.Validate(); err != nil {
-			return false, err
+			return err
 		}
 		*t = *database
 	}
-	return true, nil
+	return nil
 }
 
-// getAllDescriptors implements the DescriptorAccessor interface.
-func (p *planner) getAllDescriptors() ([]sqlbase.DescriptorProto, error) {
+// GetAllDescriptors looks up and returns all available descriptors.
+func GetAllDescriptors(ctx context.Context, txn *client.Txn) ([]sqlbase.DescriptorProto, error) {
 	descsKey := sqlbase.MakeAllDescsMetadataKey()
-	kvs, err := p.txn.Scan(descsKey, descsKey.PrefixEnd(), 0)
+	kvs, err := txn.Scan(ctx, descsKey, descsKey.PrefixEnd(), 0)
 	if err != nil {
 		return nil, err
 	}
@@ -263,49 +231,6 @@ func (p *planner) getAllDescriptors() ([]sqlbase.DescriptorProto, error) {
 			descs[i] = desc.GetDatabase()
 		default:
 			return nil, errors.Errorf("Descriptor.Union has unexpected type %T", t)
-		}
-	}
-	return descs, nil
-}
-
-// getDescriptorsFromTargetList implements the DescriptorAccessor interface.
-func (p *planner) getDescriptorsFromTargetList(
-	targets parser.TargetList,
-) ([]sqlbase.DescriptorProto, error) {
-	if targets.Databases != nil {
-		if len(targets.Databases) == 0 {
-			return nil, errNoDatabase
-		}
-		descs := make([]sqlbase.DescriptorProto, 0, len(targets.Databases))
-		for _, database := range targets.Databases {
-			descriptor, err := p.mustGetDatabaseDesc(string(database))
-			if err != nil {
-				return nil, err
-			}
-			descs = append(descs, descriptor)
-		}
-		return descs, nil
-	}
-
-	if len(targets.Tables) == 0 {
-		return nil, errNoTable
-	}
-	descs := make([]sqlbase.DescriptorProto, 0, len(targets.Tables))
-	for _, tableTarget := range targets.Tables {
-		tableGlob, err := tableTarget.NormalizeTablePattern()
-		if err != nil {
-			return nil, err
-		}
-		tables, err := p.expandTableGlob(tableGlob)
-		if err != nil {
-			return nil, err
-		}
-		for i := range tables {
-			descriptor, err := p.mustGetTableOrViewDesc(&tables[i])
-			if err != nil {
-				return nil, err
-			}
-			descs = append(descs, descriptor)
 		}
 	}
 	return descs, nil

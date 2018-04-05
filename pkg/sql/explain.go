@@ -11,92 +11,100 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
 // implied. See the License for the specific language governing
 // permissions and limitations under the License.
-//
-// Author: Peter Mattis (peter@cockroachlabs.com)
 
 package sql
 
 import (
+	"context"
 	"fmt"
 	"strings"
 
-	"github.com/cockroachdb/cockroach/pkg/sql/parser"
-	"github.com/cockroachdb/cockroach/pkg/util/tracing"
-	basictracer "github.com/opentracing/basictracer-go"
-	opentracing "github.com/opentracing/opentracing-go"
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 )
 
 type explainMode int
 
 const (
 	explainNone explainMode = iota
-	explainDebug
 	explainPlan
-	explainTrace
+	// explainDistSQL shows the physical distsql plan for a query and whether a
+	// query would be run in "auto" DISTSQL mode. See explainDistSQLNode for
+	// details.
+	explainDistSQL
 )
 
-var explainStrings = []string{"", "debug", "plan", "trace", "types"}
+var explainStrings = map[explainMode]string{
+	explainPlan:    "plan",
+	explainDistSQL: "distsql",
+}
 
 // Explain executes the explain statement, providing debugging and analysis
 // info about the wrapped statement.
 //
 // Privileges: the same privileges as the statement being explained.
-func (p *planner) Explain(n *parser.Explain, autoCommit bool) (planNode, error) {
+func (p *planner) Explain(ctx context.Context, n *tree.Explain) (planNode, error) {
 	mode := explainNone
 
 	optimized := true
 	expanded := true
 	normalizeExprs := true
-	explainer := explainer{
-		showMetadata:  false,
-		showSelectTop: false,
-		showExprs:     false,
-		showTypes:     false,
-		doIndent:      false,
+	flags := explainFlags{
+		showMetadata: false,
+		showExprs:    false,
+		showTypes:    false,
 	}
 
 	for _, opt := range n.Options {
+		optLower := strings.ToLower(opt)
 		newMode := explainNone
-		if strings.EqualFold(opt, "DEBUG") {
-			newMode = explainDebug
-		} else if strings.EqualFold(opt, "TRACE") {
-			newMode = explainTrace
-		} else if strings.EqualFold(opt, "PLAN") {
-			newMode = explainPlan
-		} else if strings.EqualFold(opt, "TYPES") {
-			newMode = explainPlan
-			explainer.showExprs = true
-			explainer.showTypes = true
-			// TYPES implies METADATA.
-			explainer.showSelectTop = true
-			explainer.showMetadata = true
-		} else if strings.EqualFold(opt, "INDENT") {
-			explainer.doIndent = true
-		} else if strings.EqualFold(opt, "SYMVARS") {
-			explainer.symbolicVars = true
-		} else if strings.EqualFold(opt, "METADATA") {
-			explainer.showSelectTop = true
-			explainer.showMetadata = true
-		} else if strings.EqualFold(opt, "QUALIFY") {
-			explainer.qualifyNames = true
-		} else if strings.EqualFold(opt, "VERBOSE") {
-			// VERBOSE implies EXPRS.
-			explainer.showExprs = true
-			// VERBOSE implies QUALIFY.
-			explainer.qualifyNames = true
-			// VERBOSE implies METADATA.
-			explainer.showSelectTop = true
-			explainer.showMetadata = true
-		} else if strings.EqualFold(opt, "EXPRS") {
-			explainer.showExprs = true
-		} else if strings.EqualFold(opt, "NOEXPAND") {
-			expanded = false
-		} else if strings.EqualFold(opt, "NONORMALIZE") {
-			normalizeExprs = false
-		} else if strings.EqualFold(opt, "NOOPTIMIZE") {
-			optimized = false
-		} else {
-			return nil, fmt.Errorf("unsupported EXPLAIN option: %s", opt)
+		// Search for the string in `explainStrings`.
+		for mode, modeStr := range explainStrings {
+			if optLower == modeStr {
+				newMode = mode
+				break
+			}
+		}
+		if newMode == explainNone {
+			switch optLower {
+			case "types":
+				newMode = explainPlan
+				flags.showExprs = true
+				flags.showTypes = true
+				// TYPES implies METADATA.
+				flags.showMetadata = true
+
+			case "symvars":
+				flags.symbolicVars = true
+
+			case "metadata":
+				flags.showMetadata = true
+
+			case "qualify":
+				flags.qualifyNames = true
+
+			case "verbose":
+				// VERBOSE implies EXPRS.
+				flags.showExprs = true
+				// VERBOSE implies QUALIFY.
+				flags.qualifyNames = true
+				// VERBOSE implies METADATA.
+				flags.showMetadata = true
+
+			case "exprs":
+				flags.showExprs = true
+
+			case "noexpand":
+				expanded = false
+
+			case "nonormalize":
+				normalizeExprs = false
+
+			case "nooptimize":
+				optimized = false
+
+			default:
+				return nil, fmt.Errorf("unsupported EXPLAIN option: %s", opt)
+			}
 		}
 		if newMode != explainNone {
 			if mode != explainNone {
@@ -109,155 +117,25 @@ func (p *planner) Explain(n *parser.Explain, autoCommit bool) (planNode, error) 
 		mode = explainPlan
 	}
 
-	if mode == explainTrace {
-		sp, err := tracing.JoinOrNewSnowball("coordinator", nil, func(sp basictracer.RawSpan) {
-			p.txn.CollectedSpans = append(p.txn.CollectedSpans, sp)
-		})
+	defer func(save bool) { p.extendedEvalCtx.SkipNormalize = save }(p.extendedEvalCtx.SkipNormalize)
+	p.extendedEvalCtx.SkipNormalize = !normalizeExprs
+
+	switch mode {
+	case explainDistSQL:
+		plan, err := p.newPlan(ctx, n.Statement, nil)
 		if err != nil {
 			return nil, err
 		}
-		p.txn.Context = opentracing.ContextWithSpan(p.txn.Context, sp)
-	}
-
-	p.evalCtx.SkipNormalize = !normalizeExprs
-
-	plan, err := p.newPlan(n.Statement, nil, autoCommit)
-	if err != nil {
-		return nil, err
-	}
-	switch mode {
-	case explainDebug:
-		return &explainDebugNode{plan}, nil
+		return &explainDistSQLNode{
+			plan: plan,
+		}, nil
 
 	case explainPlan:
-		// We may want to show placeholder types, so ensure no values
-		// are missing.
-		p.semaCtx.Placeholders.FillUnassigned()
-		return p.makeExplainPlanNode(explainer, expanded, optimized, plan), nil
-
-	case explainTrace:
-		return p.makeTraceNode(plan, p.txn), nil
+		// We may want to show placeholder types, so allow missing values.
+		p.semaCtx.Placeholders.PermitUnassigned()
+		return p.makeExplainPlanNode(ctx, flags, expanded, optimized, n.Statement)
 
 	default:
 		return nil, fmt.Errorf("unsupported EXPLAIN mode: %d", mode)
 	}
 }
-
-type debugValueType int
-
-const (
-	// The debug values do not refer to a full result row.
-	debugValuePartial debugValueType = iota
-
-	// The debug values refer to a full result row but the row was filtered out.
-	debugValueFiltered
-
-	// The debug value refers to a full result row that has been stored in a buffer
-	// and will be emitted later.
-	debugValueBuffered
-
-	// The debug values refer to a full result row.
-	debugValueRow
-)
-
-func (t debugValueType) String() string {
-	switch t {
-	case debugValuePartial:
-		return "PARTIAL"
-
-	case debugValueFiltered:
-		return "FILTERED"
-
-	case debugValueBuffered:
-		return "BUFFERED"
-
-	case debugValueRow:
-		return "ROW"
-
-	default:
-		panic(fmt.Sprintf("invalid debugValueType %d", t))
-	}
-}
-
-// debugValues is a set of values used to implement EXPLAIN (DEBUG).
-type debugValues struct {
-	rowIdx int
-	key    string
-	value  string
-	output debugValueType
-}
-
-func (vals *debugValues) AsRow() parser.DTuple {
-	keyVal := parser.DNull
-	if vals.key != "" {
-		keyVal = parser.NewDString(vals.key)
-	}
-
-	// The "output" value is NULL for partial rows, or a DBool indicating if the row passed the
-	// filtering.
-	outputVal := parser.DNull
-
-	switch vals.output {
-	case debugValueFiltered:
-		outputVal = parser.MakeDBool(false)
-
-	case debugValueRow:
-		outputVal = parser.MakeDBool(true)
-	}
-
-	return parser.DTuple{
-		parser.NewDInt(parser.DInt(vals.rowIdx)),
-		keyVal,
-		parser.NewDString(vals.value),
-		outputVal,
-	}
-}
-
-// explainDebugNode is a planNode that wraps another node and converts DebugValues() results to a
-// row of Values(). It is used as the top-level node for EXPLAIN (DEBUG) statements.
-type explainDebugNode struct {
-	plan planNode
-}
-
-// Columns for explainDebug mode.
-var debugColumns = ResultColumns{
-	{Name: "RowIdx", Typ: parser.TypeInt},
-	{Name: "Key", Typ: parser.TypeString},
-	{Name: "Value", Typ: parser.TypeString},
-	{Name: "Disposition", Typ: parser.TypeString},
-}
-
-func (*explainDebugNode) Columns() ResultColumns { return debugColumns }
-func (*explainDebugNode) Ordering() orderingInfo { return orderingInfo{} }
-
-func (n *explainDebugNode) expandPlan() error {
-	if err := n.plan.expandPlan(); err != nil {
-		return err
-	}
-	n.plan.MarkDebug(explainDebug)
-	return nil
-}
-
-func (n *explainDebugNode) Start() error        { return n.plan.Start() }
-func (n *explainDebugNode) Next() (bool, error) { return n.plan.Next() }
-func (n *explainDebugNode) Close()              { n.plan.Close() }
-
-func (n *explainDebugNode) Values() parser.DTuple {
-	vals := n.plan.DebugValues()
-
-	keyVal := parser.DNull
-	if vals.key != "" {
-		keyVal = parser.NewDString(vals.key)
-	}
-
-	return parser.DTuple{
-		parser.NewDInt(parser.DInt(vals.rowIdx)),
-		keyVal,
-		parser.NewDString(vals.value),
-		parser.NewDString(vals.output.String()),
-	}
-}
-
-func (*explainDebugNode) MarkDebug(_ explainMode)      {}
-func (*explainDebugNode) DebugValues() debugValues     { return debugValues{} }
-func (*explainDebugNode) SetLimitHint(_ int64, _ bool) {}

@@ -11,16 +11,16 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
 // implied. See the License for the specific language governing
 // permissions and limitations under the License.
-//
-// Author: Peter Mattis (peter@cockroachlabs.com)
 
 package parser
 
 import (
-	"errors"
 	"reflect"
 	"strings"
 	"testing"
+
+	"github.com/cockroachdb/cockroach/pkg/sql/lex"
+	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 
 	"github.com/cockroachdb/cockroach/pkg/testutils"
 )
@@ -41,9 +41,11 @@ func TestScanner(t *testing.T) {
 		{`<>`, []int{NOT_EQUALS}},
 		{`<=`, []int{LESS_EQUALS}},
 		{`<<`, []int{LSHIFT}},
+		{`<<=`, []int{INET_CONTAINED_BY_OR_EQUALS}},
 		{`>`, []int{'>'}},
 		{`>=`, []int{GREATER_EQUALS}},
 		{`>>`, []int{RSHIFT}},
+		{`>>=`, []int{INET_CONTAINS_OR_EQUALS}},
 		{`=`, []int{'='}},
 		{`:`, []int{':'}},
 		{`::`, []int{TYPECAST}},
@@ -63,6 +65,7 @@ func TestScanner(t *testing.T) {
 		{`^`, []int{'^'}},
 		{`$`, []int{'$'}},
 		{`&`, []int{'&'}},
+		{`&&`, []int{INET_CONTAINS_OR_CONTAINED_BY}},
 		{`|`, []int{'|'}},
 		{`||`, []int{CONCAT}},
 		{`#`, []int{'#'}},
@@ -93,15 +96,15 @@ func TestScanner(t *testing.T) {
 		{`WITH ORDINALITY`, []int{WITH_LA, ORDINALITY}},
 		{`1`, []int{ICONST}},
 		{`0xa`, []int{ICONST}},
-		{`x'2F'`, []int{SCONST}},
-		{`X'2F'`, []int{SCONST}},
+		{`x'2F'`, []int{BCONST}},
+		{`X'2F'`, []int{BCONST}},
 		{`1.0`, []int{FCONST}},
 		{`1.0e1`, []int{FCONST}},
 		{`1e+1`, []int{FCONST}},
 		{`1e-1`, []int{FCONST}},
 	}
 	for i, d := range testData {
-		s := MakeScanner(d.sql, Traditional)
+		s := MakeScanner(d.sql)
 		var tokens []int
 		for {
 			var lval sqlSymType
@@ -114,42 +117,6 @@ func TestScanner(t *testing.T) {
 
 		if !reflect.DeepEqual(d.expected, tokens) {
 			t.Errorf("%d: %q: expected %d, but found %d", i, d.sql, d.expected, tokens)
-		}
-	}
-}
-
-func TestScannerModern(t *testing.T) {
-	testData := []struct {
-		sql      string
-		expected []int
-	}{
-		{"`a`", []int{IDENT}},
-		{`foo + bar`, []int{IDENT, '+', IDENT}},
-		{`'a' "a"`, []int{SCONST, SCONST}},
-		{`b'a' b"a"`, []int{BCONST, BCONST}},
-		{`B'a' B"a"`, []int{BCONST, BCONST}},
-		{`br'a' bR"a" Br'a' BR"a"`, []int{BCONST, BCONST, BCONST, BCONST}},
-		{`rb'a' Rb"a" rB'a' RB"a"`, []int{BCONST, BCONST, BCONST, BCONST}},
-		{`e'a' e"a"`, []int{SCONST, SCONST}},
-		{`E'a' E"a"`, []int{SCONST, SCONST}},
-		{`r'a' r"a"`, []int{SCONST, SCONST}},
-		{`R'a' R"a"`, []int{SCONST, SCONST}},
-		{`$1 $foo $select`, []int{PLACEHOLDER, PLACEHOLDER, PLACEHOLDER}},
-	}
-	for i, d := range testData {
-		s := MakeScanner(d.sql, Modern)
-		var tokens []int
-		for {
-			var lval sqlSymType
-			id := s.Lex(&lval)
-			if id == 0 {
-				break
-			}
-			tokens = append(tokens, id)
-		}
-
-		if !reflect.DeepEqual(d.expected, tokens) {
-			t.Errorf("%d: expected %d, but found %d", i, d.expected, tokens)
 		}
 	}
 }
@@ -174,31 +141,7 @@ foo`, "", "foo"},
 		{`/* /* */`, "unterminated comment", ""},
 	}
 	for i, d := range testData {
-		s := MakeScanner(d.sql, Traditional)
-		var lval sqlSymType
-		present, ok := s.scanComment(&lval)
-		if d.err == "" && (!present || !ok) {
-			t.Fatalf("%d: expected success, but found %s", i, lval.str)
-		} else if d.err != "" && (present || ok || d.err != lval.str) {
-			t.Fatalf("%d: expected %s, but found %s", i, d.err, lval.str)
-		}
-		if r := s.in[s.pos:]; d.remainder != r {
-			t.Fatalf("%d: expected '%s', but found '%s'", i, d.remainder, r)
-		}
-	}
-}
-
-func TestScanCommentModern(t *testing.T) {
-	testData := []struct {
-		sql       string
-		err       string
-		remainder string
-	}{
-		{`# hello world
-foo`, "", "foo"},
-	}
-	for i, d := range testData {
-		s := MakeScanner(d.sql, Modern)
+		s := MakeScanner(d.sql)
 		var lval sqlSymType
 		present, ok := s.scanComment(&lval)
 		if d.err == "" && (!present || !ok) {
@@ -213,12 +156,12 @@ foo`, "", "foo"},
 }
 
 func TestScanKeyword(t *testing.T) {
-	for kwName, kwID := range keywords {
-		s := MakeScanner(kwName, Traditional)
+	for kwName, kwID := range lex.Keywords {
+		s := MakeScanner(kwName)
 		var lval sqlSymType
 		id := s.Lex(&lval)
-		if kwID != id {
-			t.Errorf("%s: expected %d, but found %d", kwName, kwID, id)
+		if kwID.Tok != id {
+			t.Errorf("%s: expected %d, but found %d", kwName, kwID.Tok, id)
 		}
 	}
 }
@@ -229,12 +172,16 @@ func TestScanNumber(t *testing.T) {
 		expected string
 		id       int
 	}{
+		{`0`, `0`, ICONST},
+		{`000`, `0`, ICONST},
 		{`1`, `1`, ICONST},
 		{`0x1`, `0x1`, ICONST},
 		{`0X2`, `0X2`, ICONST},
 		{`0xff`, `0xff`, ICONST},
 		{`0xff.`, `0xff`, ICONST},
 		{`12345`, `12345`, ICONST},
+		{`08`, `8`, ICONST},
+		{`0011`, `11`, ICONST},
 		{`1.`, `1.`, FCONST},
 		{`.1`, `.1`, FCONST},
 		{`1..2`, `1`, ICONST},
@@ -250,7 +197,7 @@ func TestScanNumber(t *testing.T) {
 		{`9223372036854775809`, `9223372036854775809`, ICONST},
 	}
 	for _, d := range testData {
-		s := MakeScanner(d.sql, Traditional)
+		s := MakeScanner(d.sql)
 		var lval sqlSymType
 		id := s.Lex(&lval)
 		if d.id != id {
@@ -272,7 +219,7 @@ func TestScanPlaceholder(t *testing.T) {
 		{`$123`, 123},
 	}
 	for _, d := range testData {
-		s := MakeScanner(d.sql, Traditional)
+		s := MakeScanner(d.sql)
 		var lval sqlSymType
 		id := s.Lex(&lval)
 		if id != PLACEHOLDER {
@@ -346,48 +293,10 @@ world'`, `hello
 world`},
 		{`x'666f6f'`, `foo`},
 		{`X'626172'`, `bar`},
-		{`X'FF'`, `invalid UTF-8 byte sequence`},
+		{`X'FF'`, "\xff"},
 	}
 	for _, d := range testData {
-		s := MakeScanner(d.sql, Traditional)
-		var lval sqlSymType
-		_ = s.Lex(&lval)
-		if d.expected != lval.str {
-			t.Errorf("%s: expected %q, but found %q", d.sql, d.expected, lval.str)
-		}
-	}
-}
-
-func TestScanStringModern(t *testing.T) {
-	testData := []struct {
-		sql      string
-		expected string
-	}{
-		// Modern syntax allows escapes without the 'e' or 'E' specifier.
-		{`"\x41"`, `A`},
-		{`'\x41'`, `A`},
-		{`b"\x41"`, `A`},
-		{`B'\x41'`, `A`},
-		{`e"\x41"`, `A`},
-		{`E'\x41'`, `A`},
-		{`e"\xff"`, `invalid UTF-8 byte sequence`},
-		{`E'\xff'`, `invalid UTF-8 byte sequence`},
-		// Disable escapes with raw strings.
-		{`r"\x41"`, `\x41`},
-		{`R'\x41'`, `\x41`},
-		// Triple-quoted strings allow non-escaped quotes.
-		{`"""hello"world"""`, `hello"world`},
-		{`'''hello''world'''`, `hello''world`},
-		// Triple-quoted strings allow embedded newlines.
-		{`'''hello
-world'''`, `hello
-world`},
-		// Single/double-quoted strings do not allow newlines.
-		{`'hello
-world'`, `invalid syntax: embedded newline`},
-	}
-	for _, d := range testData {
-		s := MakeScanner(d.sql, Modern)
+		s := MakeScanner(d.sql)
 		var lval sqlSymType
 		_ = s.Lex(&lval)
 		if d.expected != lval.str {
@@ -410,22 +319,21 @@ func TestScanError(t *testing.T) {
 		{`1.0x`, "invalid hexadecimal numeric literal"},
 		{`0x0x`, "invalid hexadecimal numeric literal"},
 		{`00x0x`, "invalid hexadecimal numeric literal"},
-		{`08`, "could not make constant int from literal \"08\""},
-		{`x'zzz'`, "invalid hexadecimal string literal"},
-		{`X'zzz'`, "invalid hexadecimal string literal"},
-		{`x'beef\x41'`, "invalid hexadecimal string literal"},
-		{`X'beef\x41\x41'`, "invalid hexadecimal string literal"},
-		{`x'''1'''`, "invalid hexadecimal string literal"},
+		{`x'zzz'`, "invalid hexadecimal bytes literal"},
+		{`X'zzz'`, "invalid hexadecimal bytes literal"},
+		{`x'beef\x41'`, "invalid hexadecimal bytes literal"},
+		{`X'beef\x41\x41'`, "invalid hexadecimal bytes literal"},
+		{`x'''1'''`, "invalid hexadecimal bytes literal"},
 		{`$9223372036854775809`, "integer value out of range"},
 	}
 	for _, d := range testData {
-		s := MakeScanner(d.sql, Traditional)
+		s := MakeScanner(d.sql)
 		var lval sqlSymType
 		id := s.Lex(&lval)
 		if id != ERROR {
 			t.Errorf("%s: expected ERROR, but found %d", d.sql, id)
 		}
-		if !testutils.IsError(errors.New(lval.str), d.err) {
+		if !testutils.IsError(pgerror.NewError(pgerror.CodeInternalError, lval.str), d.err) {
 			t.Errorf("%s: expected %s, but found %v", d.sql, d.err, lval.str)
 		}
 	}

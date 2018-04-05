@@ -11,25 +11,30 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
 // implied. See the License for the specific language governing
 // permissions and limitations under the License.
-//
-// Author: Matt Tracy (matt.r.tracy@gmail.com)
 
 package status
 
 import (
+	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
+	"os"
 	"strconv"
-
-	"golang.org/x/net/context"
+	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/build"
+	"github.com/cockroachdb/cockroach/pkg/gossip"
 	"github.com/cockroachdb/cockroach/pkg/internal/client"
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
+	"github.com/cockroachdb/cockroach/pkg/rpc"
+	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
+	"github.com/cockroachdb/cockroach/pkg/storage"
 	"github.com/cockroachdb/cockroach/pkg/storage/engine/enginepb"
 	"github.com/cockroachdb/cockroach/pkg/ts/tspb"
+	"github.com/cockroachdb/cockroach/pkg/util/envutil"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/metric"
@@ -44,6 +49,9 @@ const (
 	// nodeTimeSeriesPrefix is the common prefix for time series keys which
 	// record node-specific data.
 	nodeTimeSeriesPrefix = "cr.node.%s"
+
+	advertiseAddrLabelKey = "advertise-addr"
+	httpAddrLabelKey      = "http-addr"
 )
 
 type quantile struct {
@@ -80,11 +88,16 @@ type storeMetrics interface {
 // store hosted by the node. There are slight differences in the way these are
 // recorded, and they are thus kept separate.
 type MetricsRecorder struct {
-	// prometheusExporter merges metrics into families and generates the
-	// prometheus text format.
-	prometheusExporter metric.PrometheusExporter
-	mu                 struct {
+	gossip       *gossip.Gossip
+	nodeLiveness *storage.NodeLiveness
+	rpcContext   *rpc.Context
+	settings     *cluster.Settings
+
+	mu struct {
 		syncutil.Mutex
+		// prometheusExporter merges metrics into families and generates the
+		// prometheus text format.
+		prometheusExporter metric.PrometheusExporter
 		// nodeRegistry contains, as subregistries, the multiple component-specific
 		// registries which are recorded as "node level" metrics.
 		nodeRegistry *metric.Registry
@@ -112,11 +125,22 @@ type MetricsRecorder struct {
 
 // NewMetricsRecorder initializes a new MetricsRecorder object that uses the
 // given clock.
-func NewMetricsRecorder(clock *hlc.Clock) *MetricsRecorder {
-	mr := &MetricsRecorder{}
+func NewMetricsRecorder(
+	clock *hlc.Clock,
+	nodeLiveness *storage.NodeLiveness,
+	rpcContext *rpc.Context,
+	gossip *gossip.Gossip,
+	settings *cluster.Settings,
+) *MetricsRecorder {
+	mr := &MetricsRecorder{
+		nodeLiveness: nodeLiveness,
+		rpcContext:   rpcContext,
+		gossip:       gossip,
+		settings:     settings,
+	}
 	mr.mu.storeRegistries = make(map[roachpb.StoreID]*metric.Registry)
 	mr.mu.stores = make(map[roachpb.StoreID]storeMetrics)
-	mr.prometheusExporter = metric.MakePrometheusExporter()
+	mr.mu.prometheusExporter = metric.MakePrometheusExporter()
 	mr.mu.clock = clock
 	return mr
 }
@@ -124,13 +148,27 @@ func NewMetricsRecorder(clock *hlc.Clock) *MetricsRecorder {
 // AddNode adds the Registry from an initialized node, along with its descriptor
 // and start time.
 func (mr *MetricsRecorder) AddNode(
-	reg *metric.Registry, desc roachpb.NodeDescriptor, startedAt int64,
+	reg *metric.Registry,
+	desc roachpb.NodeDescriptor,
+	startedAt int64,
+	advertiseAddr, httpAddr string,
 ) {
 	mr.mu.Lock()
 	defer mr.mu.Unlock()
 	mr.mu.nodeRegistry = reg
 	mr.mu.desc = desc
 	mr.mu.startedAt = startedAt
+
+	// Create node ID gauge metric with host as a label.
+	metadata := metric.Metadata{
+		Name: "node-id",
+		Help: "node ID with labels for advertised RPC and HTTP addresses",
+	}
+	metadata.AddLabel(advertiseAddrLabelKey, advertiseAddr)
+	metadata.AddLabel(httpAddrLabelKey, httpAddr)
+	nodeIDGauge := metric.NewGauge(metadata)
+	nodeIDGauge.Update(int64(desc.NodeID))
+	reg.AddMetric(nodeIDGauge)
 }
 
 // AddStore adds the Registry from the provided store as a store-level registry
@@ -173,10 +211,8 @@ func (mr *MetricsRecorder) MarshalJSON() ([]byte, error) {
 	return json.Marshal(topLevel)
 }
 
-// scrapePrometheus updates the prometheusExporter's metrics snapshot.
-func (mr *MetricsRecorder) scrapePrometheus() {
-	mr.mu.Lock()
-	defer mr.mu.Unlock()
+// scrapePrometheusLocked updates the prometheusExporter's metrics snapshot.
+func (mr *MetricsRecorder) scrapePrometheusLocked() {
 	if mr.mu.nodeRegistry == nil {
 		// We haven't yet processed initialization information; output nothing.
 		if log.V(1) {
@@ -184,16 +220,31 @@ func (mr *MetricsRecorder) scrapePrometheus() {
 		}
 	}
 
-	mr.prometheusExporter.ScrapeRegistry(mr.mu.nodeRegistry)
+	mr.mu.prometheusExporter.ScrapeRegistry(mr.mu.nodeRegistry)
 	for _, reg := range mr.mu.storeRegistries {
-		mr.prometheusExporter.ScrapeRegistry(reg)
+		mr.mu.prometheusExporter.ScrapeRegistry(reg)
 	}
 }
 
 // PrintAsText writes the current metrics values as plain-text to the writer.
+// We write metrics to a temporary buffer which is then copied to the writer.
+// This is to avoid hanging requests from holding the lock.
 func (mr *MetricsRecorder) PrintAsText(w io.Writer) error {
-	mr.scrapePrometheus()
-	return mr.prometheusExporter.PrintAsText(w)
+	var buf bytes.Buffer
+	if err := mr.lockAndPrintAsText(&buf); err != nil {
+		return err
+	}
+	_, err := buf.WriteTo(w)
+	return err
+}
+
+// lockAndPrintAsText grabs the recorder lock and generates the prometheus
+// metrics page.
+func (mr *MetricsRecorder) lockAndPrintAsText(w io.Writer) error {
+	mr.mu.Lock()
+	defer mr.mu.Unlock()
+	mr.scrapePrometheusLocked()
+	return mr.mu.prometheusExporter.PrintAsText(w)
 }
 
 // GetTimeSeriesData serializes registered metrics for consumption by
@@ -236,24 +287,68 @@ func (mr *MetricsRecorder) GetTimeSeriesData() []tspb.TimeSeriesData {
 	return data
 }
 
-// GetStatusSummary returns a status summary messages for the node. The summary
+// getNetworkActivity produces three maps detailing information about
+// network activity between this node and all other nodes. The maps
+// are incoming throughput, outgoing throughput, and average
+// latency. Throughputs are stored as bytes, and latencies as nanos.
+func (mr *MetricsRecorder) getNetworkActivity(
+	ctx context.Context,
+) map[roachpb.NodeID]NodeStatus_NetworkActivity {
+	activity := make(map[roachpb.NodeID]NodeStatus_NetworkActivity)
+	if mr.nodeLiveness != nil && mr.gossip != nil {
+		isLiveMap := mr.nodeLiveness.GetIsLiveMap()
+
+		throughputMap := mr.rpcContext.GetStatsMap()
+		var currentAverages map[string]time.Duration
+		if mr.rpcContext.RemoteClocks != nil {
+			currentAverages = mr.rpcContext.RemoteClocks.AllLatencies()
+		}
+		for nodeID, alive := range isLiveMap {
+			address, err := mr.gossip.GetNodeIDAddress(nodeID)
+			if err != nil {
+				if alive {
+					log.Warning(ctx, err.Error())
+				}
+				continue
+			}
+			na := NodeStatus_NetworkActivity{}
+			key := address.String()
+			if tp, ok := throughputMap.Load(key); ok {
+				stats := tp.(*rpc.Stats)
+				na.Incoming = stats.Incoming()
+				na.Outgoing = stats.Outgoing()
+			}
+			if alive {
+				if latency, ok := currentAverages[key]; ok {
+					na.Latency = latency.Nanoseconds()
+				}
+			}
+			activity[nodeID] = na
+		}
+	}
+	return activity
+}
+
+// GetStatusSummary returns a status summary message for the node. The summary
 // includes the recent values of metrics for both the node and all of its
 // component stores.
-func (mr *MetricsRecorder) GetStatusSummary() *NodeStatus {
+func (mr *MetricsRecorder) GetStatusSummary(ctx context.Context) *NodeStatus {
+	activity := mr.getNetworkActivity(ctx)
+
 	mr.mu.Lock()
 	defer mr.mu.Unlock()
 
 	if mr.mu.nodeRegistry == nil {
 		// We haven't yet processed initialization information; do nothing.
 		if log.V(1) {
-			log.Warning(context.TODO(), "attempt to generate status summary before NodeID allocation.")
+			log.Warning(ctx, "attempt to generate status summary before NodeID allocation.")
 		}
 		return nil
 	}
 
 	now := mr.mu.clock.PhysicalNow()
 
-	// Generate an node status with no store data.
+	// Generate a node status with no store data.
 	nodeStat := &NodeStatus{
 		Desc:          mr.mu.desc,
 		BuildInfo:     build.GetInfo(),
@@ -261,6 +356,18 @@ func (mr *MetricsRecorder) GetStatusSummary() *NodeStatus {
 		StartedAt:     mr.mu.startedAt,
 		StoreStatuses: make([]StoreStatus, 0, mr.mu.lastSummaryCount),
 		Metrics:       make(map[string]float64, mr.mu.lastNodeMetricCount),
+		Args:          os.Args,
+		Env:           envutil.GetEnvVarsUsed(),
+		Activity:      activity,
+	}
+
+	// If the cluster hasn't yet been definitively moved past the network stats
+	// phase, ensure that we provide latencies separately for backwards compatibility.
+	if !mr.settings.Version.IsMinSupported(cluster.VersionRPCNetworkStats) {
+		nodeStat.Latencies = make(map[roachpb.NodeID]int64)
+		for nodeID, na := range nodeStat.Activity {
+			nodeStat.Latencies[nodeID] = na.Latency
+		}
 	}
 
 	eachRecordableValue(mr.mu.nodeRegistry, func(name string, val float64) {
@@ -300,7 +407,7 @@ func (mr *MetricsRecorder) WriteStatusSummary(ctx context.Context, db *client.DB
 	mr.writeSummaryMu.Lock()
 	defer mr.writeSummaryMu.Unlock()
 
-	nodeStatus := mr.GetStatusSummary()
+	nodeStatus := mr.GetStatusSummary(ctx)
 	if nodeStatus != nil {
 		key := keys.NodeStatusKey(nodeStatus.Desc.NodeID)
 		// We use PutInline to store only a single version of the node status.

@@ -12,15 +12,12 @@
 // implied. See the License for the specific language governing
 // permissions and limitations under the License. See the AUTHORS file
 // for names of contributors.
-//
-// Author: Kenji Kaneda (kenji.kaneda@gmail.com)
 
 package storage
 
 import (
+	"context"
 	"testing"
-
-	"golang.org/x/net/context"
 
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
@@ -35,12 +32,23 @@ func TestPushTransactionsWithNonPendingIntent(t *testing.T) {
 
 	tc := testContext{}
 	stopper := stop.NewStopper()
-	defer stopper.Stop()
+	defer stopper.Stop(context.TODO())
 	tc.Start(t, stopper)
 
-	intents := []roachpb.Intent{{Span: roachpb.Span{Key: roachpb.Key("a")}, Status: roachpb.ABORTED}}
-	if _, pErr := tc.store.intentResolver.maybePushTransactions(
-		context.Background(), intents, roachpb.Header{}, roachpb.PUSH_TOUCH, true); !testutils.IsPError(pErr, "unexpected aborted/resolved intent") {
-		t.Errorf("expected error on aborted/resolved intent, but got %s", pErr)
+	testCases := [][]roachpb.Intent{
+		{{Span: roachpb.Span{Key: roachpb.Key("a")}, Status: roachpb.PENDING},
+			{Span: roachpb.Span{Key: roachpb.Key("b")}, Status: roachpb.ABORTED}},
+		{{Span: roachpb.Span{Key: roachpb.Key("a")}, Status: roachpb.PENDING},
+			{Span: roachpb.Span{Key: roachpb.Key("b")}, Status: roachpb.COMMITTED}},
+	}
+	for _, intents := range testCases {
+		if _, pErr := tc.store.intentResolver.maybePushTransactions(
+			context.Background(), intents, roachpb.Header{}, roachpb.PUSH_TOUCH, true,
+		); !testutils.IsPError(pErr, "unexpected (ABORTED|COMMITTED) intent") {
+			t.Errorf("expected error on aborted/resolved intent, but got %s", pErr)
+		}
+		if cnt := len(tc.store.intentResolver.mu.inFlightPushes); cnt != 0 {
+			t.Errorf("expected no inflight pushe refcount map entries, found %d", cnt)
+		}
 	}
 }

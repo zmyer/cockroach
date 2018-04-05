@@ -11,12 +11,12 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
 // implied. See the License for the specific language governing
 // permissions and limitations under the License.
-//
-// Author: Matt Tracy (matt.r.tracy@gmail.com)
 
 package status
 
 import (
+	"context"
+	"os"
 	"reflect"
 	"sort"
 	"strconv"
@@ -27,11 +27,13 @@ import (
 
 	"github.com/cockroachdb/cockroach/pkg/build"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
+	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/storage/engine/enginepb"
 	"github.com/cockroachdb/cockroach/pkg/ts/tspb"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 	"github.com/cockroachdb/cockroach/pkg/util/metric"
+	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 )
 
 // byTimeAndName is a slice of tspb.TimeSeriesData.
@@ -118,6 +120,7 @@ func TestMetricsRecorder(t *testing.T) {
 		Capacity: roachpb.StoreCapacity{
 			Capacity:  100,
 			Available: 50,
+			Used:      50,
 		},
 	}
 	storeDesc2 := roachpb.StoreDescriptor{
@@ -125,6 +128,7 @@ func TestMetricsRecorder(t *testing.T) {
 		Capacity: roachpb.StoreCapacity{
 			Capacity:  200,
 			Available: 75,
+			Used:      125,
 		},
 	}
 
@@ -144,16 +148,17 @@ func TestMetricsRecorder(t *testing.T) {
 		registry: metric.NewRegistry(),
 	}
 	manual := hlc.NewManualClock(100)
-	recorder := NewMetricsRecorder(hlc.NewClock(manual.UnixNano, time.Nanosecond))
+	st := cluster.MakeTestingClusterSettings()
+	recorder := NewMetricsRecorder(hlc.NewClock(manual.UnixNano, time.Nanosecond), nil, nil, nil, st)
 	recorder.AddStore(store1)
 	recorder.AddStore(store2)
-	recorder.AddNode(reg1, nodeDesc, 50)
+	recorder.AddNode(reg1, nodeDesc, 50, "foo:26257", "foo:26258")
 
 	// Ensure the metric system's view of time does not advance during this test
 	// as the test expects time to not advance too far which would age the actual
 	// data (e.g. in histogram's) unexpectedly.
 	defer metric.TestingSetNow(func() time.Time {
-		return time.Unix(0, manual.UnixNano()).UTC()
+		return timeutil.Unix(0, manual.UnixNano())
 	})()
 
 	// ========================================
@@ -252,6 +257,11 @@ func TestMetricsRecorder(t *testing.T) {
 		}
 	}
 
+	// Add metric for node ID.
+	g := metric.NewGauge(metric.Metadata{Name: "node-id"})
+	g.Update(int64(nodeDesc.NodeID))
+	addExpected("", "node-id", 1, 100, g.Value(), true)
+
 	for _, reg := range regList {
 		for _, data := range metricNames {
 			switch data.typ {
@@ -331,13 +341,29 @@ func TestMetricsRecorder(t *testing.T) {
 		},
 	}
 
-	nodeSummary := recorder.GetStatusSummary()
+	// Make sure there is at least one environment variable that will be
+	// reported.
+	if err := os.Setenv("GOGC", "100"); err != nil {
+		t.Fatal(err)
+	}
+
+	nodeSummary := recorder.GetStatusSummary(context.Background())
 	if nodeSummary == nil {
 		t.Fatalf("recorder did not return nodeSummary")
 	}
+	if len(nodeSummary.Args) == 0 {
+		t.Fatalf("expected args to be present")
+	}
+	if len(nodeSummary.Env) == 0 {
+		t.Fatalf("expected env to be present")
+	}
+	nodeSummary.Args = nil
+	nodeSummary.Env = nil
+	nodeSummary.Activity = nil
+	nodeSummary.Latencies = nil
 
 	sort.Sort(byStoreDescID(nodeSummary.StoreStatuses))
 	if a, e := nodeSummary, expectedNodeSummary; !reflect.DeepEqual(a, e) {
-		t.Errorf("recorder did not produce expected NodeSummary; diff:\n %v", pretty.Diff(e, a))
+		t.Errorf("recorder did not produce expected NodeSummary; diff:\n %s", pretty.Diff(e, a))
 	}
 }

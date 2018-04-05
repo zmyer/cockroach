@@ -11,13 +11,12 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
 // implied. See the License for the specific language governing
 // permissions and limitations under the License.
-//
-// Author: Peter Mattis (peter@cockroachlabs.com)
 
 package buildutil
 
 import (
 	"go/build"
+	"runtime"
 	"strings"
 	"testing"
 )
@@ -44,6 +43,14 @@ func TransitiveImports(importPath string, cgo bool) (map[string]struct{}, error)
 			}
 			importPkg, err := buildContext.Import(imp, pkg.Dir, build.FindOnly)
 			if err != nil {
+				// go/build does not know that gccgo's standard packages don't have
+				// source, and will report an error saying that it can not find them.
+				//
+				// See https://github.com/golang/go/issues/16701
+				// and https://github.com/golang/go/issues/23607.
+				if runtime.Compiler == "gccgo" {
+					continue
+				}
 				return err
 			}
 			imp = importPkg.ImportPath

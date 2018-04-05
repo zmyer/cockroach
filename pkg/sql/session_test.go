@@ -11,26 +11,76 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
 // implied. See the License for the specific language governing
 // permissions and limitations under the License.
-//
-// Author: Andrei Matei (andreimatei1@gmail.com)
 
 package sql_test
 
 import (
+	"context"
 	"database/sql/driver"
+	"fmt"
 	"net/url"
+	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
+	"github.com/lib/pq"
+
+	"github.com/cockroachdb/cockroach/pkg/base"
+	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/security"
 	"github.com/cockroachdb/cockroach/pkg/sql"
+	"github.com/cockroachdb/cockroach/pkg/sql/tests"
+	"github.com/cockroachdb/cockroach/pkg/storage"
+	"github.com/cockroachdb/cockroach/pkg/storage/storagebase"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/serverutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/sqlutils"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
+	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
-	"github.com/lib/pq"
 )
+
+func TestAnonymizeStatementsForReporting(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+
+	const stmt = `
+INSERT INTO sensitive(super, sensible) VALUES('that', 'nobody', 'must', 'see');
+
+select * from crdb_internal.node_runtime_info;
+`
+
+	rUnsafe := "i'm not safe"
+	rSafe := log.Safe("something safe")
+
+	safeErr := sql.AnonymizeStatementsForReporting("testing", stmt, rUnsafe)
+
+	const (
+		expMessage = "panic while testing 2 statements: INSERT INTO _(_, _) VALUES " +
+			"(_, _, _, _); SELECT * FROM _._; caused by i'm not safe"
+		expSafeRedactedMessage = "?:0: panic while testing 2 statements: INSERT INTO _(_, _) VALUES " +
+			"(_, _, _, _); SELECT * FROM _._: caused by <redacted>"
+		expSafeSafeMessage = "?:0: panic while testing 2 statements: INSERT INTO _(_, _) VALUES " +
+			"(_, _, _, _); SELECT * FROM _._: caused by something safe"
+	)
+
+	actMessage := safeErr.Error()
+	if actMessage != expMessage {
+		t.Fatalf("wanted: %s\ngot: %s", expMessage, actMessage)
+	}
+
+	actSafeRedactedMessage := log.ReportablesToSafeError(0, "", []interface{}{safeErr}).Error()
+	if actSafeRedactedMessage != expSafeRedactedMessage {
+		t.Fatalf("wanted: %s\ngot: %s", expSafeRedactedMessage, actSafeRedactedMessage)
+	}
+
+	safeErr = sql.AnonymizeStatementsForReporting("testing", stmt, rSafe)
+
+	actSafeSafeMessage := log.ReportablesToSafeError(0, "", []interface{}{safeErr}).Error()
+	if actSafeSafeMessage != expSafeSafeMessage {
+		t.Fatalf("wanted: %s\ngot: %s", expSafeSafeMessage, actSafeSafeMessage)
+	}
+}
 
 // Test that a connection closed abruptly while a SQL txn is in progress results
 // in that txn being rolled back.
@@ -38,10 +88,11 @@ func TestSessionFinishRollsBackTxn(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	aborter := NewTxnAborter()
 	defer aborter.Close(t)
-	params, _ := createTestServerParams()
-	params.Knobs.SQLExecutor = aborter.executorKnobs()
+	params, _ := tests.CreateTestServerParams()
+	var activateKnobs func()
+	params.Knobs.SQLExecutor, activateKnobs = aborter.executorKnobs()
 	s, mainDB, _ := serverutils.StartServer(t, params)
-	defer s.Stopper().Stop()
+	defer s.Stopper().Stop(context.TODO())
 	{
 		pgURL, cleanup := sqlutils.PGUrl(
 			t, s.ServingAddr(), "TestSessionFinishRollsBackTxn", url.User(security.RootUser))
@@ -50,9 +101,16 @@ func TestSessionFinishRollsBackTxn(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
+
+	// After this point, the abort knob is active. This also means that
+	// the AST is checked for modification. So we have to use fully
+	// qualified table names throughout to avoid a mismatch due to table
+	// qualification.
+	activateKnobs()
+
 	if _, err := mainDB.Exec(`
 CREATE DATABASE t;
-CREATE TABLE t.test (k INT PRIMARY KEY, v TEXT);
+CREATE TABLE t.public.test (k INT PRIMARY KEY, v TEXT);
 `); err != nil {
 		t.Fatal(err)
 	}
@@ -70,7 +128,7 @@ CREATE TABLE t.test (k INT PRIMARY KEY, v TEXT);
 			pgURL, cleanupDB := sqlutils.PGUrl(
 				t, s.ServingAddr(), state.String(), url.User(security.RootUser))
 			defer cleanupDB()
-			conn, err := pq.Open(pgURL.String())
+			c, err := pq.Open(pgURL.String())
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -79,27 +137,29 @@ CREATE TABLE t.test (k INT PRIMARY KEY, v TEXT);
 				if connClosed {
 					return
 				}
-				if err := conn.Close(); err != nil {
+				if err := c.Close(); err != nil {
 					t.Fatal(err)
 				}
 			}()
 
-			txn, err := conn.Begin()
+			ctx := context.TODO()
+			conn := c.(driver.ConnBeginTx)
+			txn, err := conn.BeginTx(ctx, driver.TxOptions{})
 			if err != nil {
 				t.Fatal(err)
 			}
-			tx := txn.(driver.Execer)
-			if _, err := tx.Exec("SET TRANSACTION PRIORITY NORMAL", nil); err != nil {
+			tx := txn.(driver.ExecerContext)
+			if _, err := tx.ExecContext(ctx, "SET TRANSACTION PRIORITY NORMAL", nil); err != nil {
 				t.Fatal(err)
 			}
 
 			if state == sql.RestartWait || state == sql.CommitWait {
-				if _, err := tx.Exec("SAVEPOINT cockroach_restart", nil); err != nil {
+				if _, err := tx.ExecContext(ctx, "SAVEPOINT cockroach_restart", nil); err != nil {
 					t.Fatal(err)
 				}
 			}
 
-			insertStmt := "INSERT INTO t.test(k, v) VALUES (1, 'a')"
+			insertStmt := "INSERT INTO t.public.test(k, v) VALUES (1, 'a')"
 			if state == sql.RestartWait {
 				// To get a txn in RestartWait, we'll use an aborter.
 				if err := aborter.QueueStmtForAbortion(
@@ -107,7 +167,7 @@ CREATE TABLE t.test (k INT PRIMARY KEY, v TEXT);
 					t.Fatal(err)
 				}
 			}
-			if _, err := tx.Exec(insertStmt, nil); err != nil {
+			if _, err := tx.ExecContext(ctx, insertStmt, nil); err != nil {
 				t.Fatal(err)
 			}
 
@@ -116,7 +176,7 @@ CREATE TABLE t.test (k INT PRIMARY KEY, v TEXT);
 			}
 
 			if state == sql.RestartWait || state == sql.CommitWait {
-				_, err := tx.Exec("RELEASE SAVEPOINT cockroach_restart", nil)
+				_, err := tx.ExecContext(ctx, "RELEASE SAVEPOINT cockroach_restart", nil)
 				if state == sql.CommitWait {
 					if err != nil {
 						t.Fatal(err)
@@ -128,7 +188,7 @@ CREATE TABLE t.test (k INT PRIMARY KEY, v TEXT);
 
 			// Abruptly close the connection.
 			connClosed = true
-			if err := conn.Close(); err != nil {
+			if err := c.Close(); err != nil {
 				t.Fatal(err)
 			}
 
@@ -152,7 +212,7 @@ CREATE TABLE t.test (k INT PRIMARY KEY, v TEXT);
 			}
 			ts := timeutil.Now()
 			var count int
-			if err := txCheck.QueryRow("SELECT count(1) FROM t.test").Scan(&count); err != nil {
+			if err := txCheck.QueryRow("SELECT count(1) FROM t.public.test").Scan(&count); err != nil {
 				t.Fatal(err)
 			}
 			// CommitWait actually committed, so we'll need to clean up.
@@ -161,7 +221,7 @@ CREATE TABLE t.test (k INT PRIMARY KEY, v TEXT);
 					t.Fatalf("expected no rows, got: %d", count)
 				}
 			} else {
-				if _, err := txCheck.Exec("DELETE FROM t.test"); err != nil {
+				if _, err := txCheck.Exec("DELETE FROM t.public.test"); err != nil {
 					t.Fatal(err)
 				}
 			}
@@ -174,5 +234,123 @@ CREATE TABLE t.test (k INT PRIMARY KEY, v TEXT);
 			}
 
 		})
+	}
+}
+
+// Test two things about non-retriable errors happening when the Executor does
+// an "autoCommit" (i.e. commits the KV txn after running an implicit
+// transaction):
+// 1) The error is reported to the client.
+// 2) The error doesn't leave the session in the Aborted state. After running
+// implicit transactions, the state should always be NoTxn, regardless of any
+// errors.
+func TestNonRetriableErrorOnAutoCommit(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+
+	query := "SELECT 42"
+
+	params := base.TestServerArgs{
+		Knobs: base.TestingKnobs{
+			SQLExecutor: &sql.ExecutorTestingKnobs{
+				BeforeAutoCommit: func(ctx context.Context, stmt string) error {
+					if strings.Contains(stmt, query) {
+						return fmt.Errorf("injected autocommit error")
+					}
+					return nil
+				},
+			},
+		},
+	}
+	s, sqlDB, _ := serverutils.StartServer(t, params)
+	defer s.Stopper().Stop(context.TODO())
+
+	sqlDB.SetMaxOpenConns(1)
+
+	if _, err := sqlDB.Exec(query); !testutils.IsError(err, "injected") {
+		t.Fatalf("expected injected error, got: %v", err)
+	}
+
+	var state string
+	if err := sqlDB.QueryRow("SHOW TRANSACTION STATUS").Scan(&state); err != nil {
+		t.Fatal(err)
+	}
+	if state != "NoTxn" {
+		t.Fatalf("expected state %s, got: %s", "NoTxn", state)
+	}
+}
+
+// Test that, if a ROLLBACK statement encounters an error, the error is not
+// returned to the client and the session state is transitioned to NoTxn.
+func TestErrorOnRollback(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+
+	const targetKeyString string = "/Table/51/1/1/0"
+	var injectedErr int64
+
+	// We're going to inject an error into our EndTransaction.
+	params := base.TestServerArgs{
+		Knobs: base.TestingKnobs{
+			Store: &storage.StoreTestingKnobs{
+				TestingProposalFilter: func(fArgs storagebase.ProposalFilterArgs) *roachpb.Error {
+					if !fArgs.Req.IsSingleRequest() {
+						return nil
+					}
+					req := fArgs.Req.Requests[0]
+					etReq, ok := req.GetInner().(*roachpb.EndTransactionRequest)
+					// We only inject the error once. Turns out that during the life of
+					// the test there's two EndTransactions being sent - one is the direct
+					// result of the test's call to tx.Rollback(), the second is sent by
+					// the TxnCoordSender - indirectly triggered by the fact that, on the
+					// server side, the transaction's context gets canceled at the SQL
+					// layer.
+					if ok &&
+						etReq.Header().Key.String() == targetKeyString &&
+						atomic.LoadInt64(&injectedErr) == 0 {
+
+						atomic.StoreInt64(&injectedErr, 1)
+						return roachpb.NewErrorf("test injected error")
+					}
+					return nil
+				},
+			},
+		},
+	}
+	s, sqlDB, _ := serverutils.StartServer(t, params)
+	ctx := context.TODO()
+	defer s.Stopper().Stop(ctx)
+
+	if _, err := sqlDB.Exec(`
+CREATE DATABASE t;
+CREATE TABLE t.test (k INT PRIMARY KEY, v TEXT);
+`); err != nil {
+		t.Fatal(err)
+	}
+
+	tx, err := sqlDB.Begin()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Perform a write so that the EndTransaction we're going to send doesn't get
+	// elided.
+	if _, err := tx.ExecContext(ctx, "INSERT INTO t.test(k, v) VALUES (1, 'abc')"); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := tx.Rollback(); err != nil {
+		t.Fatal(err)
+	}
+
+	var state string
+	if err := sqlDB.QueryRow("SHOW TRANSACTION STATUS").Scan(&state); err != nil {
+		t.Fatal(err)
+	}
+	if state != "NoTxn" {
+		t.Fatalf("expected state %s, got: %s", "NoTxn", state)
+	}
+
+	if atomic.LoadInt64(&injectedErr) == 0 {
+		t.Fatal("test didn't inject the error; it must have failed to find " +
+			"the EndTransaction with the expected key")
 	}
 }

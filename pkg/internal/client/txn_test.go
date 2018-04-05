@@ -11,141 +11,127 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
 // implied. See the License for the specific language governing
 // permissions and limitations under the License.
-//
-// Author: Peter Mattis (peter@cockroachlabs.com)
 
 package client
 
 import (
+	"bytes"
+	"context"
+	"fmt"
 	"reflect"
+	"regexp"
 	"testing"
 	"time"
 
-	basictracer "github.com/opentracing/basictracer-go"
-	opentracing "github.com/opentracing/opentracing-go"
 	"github.com/pkg/errors"
-	"golang.org/x/net/context"
-
-	"regexp"
+	"golang.org/x/sync/errgroup"
 
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
+	"github.com/cockroachdb/cockroach/pkg/util/syncutil"
 	"github.com/cockroachdb/cockroach/pkg/util/tracing"
-	"github.com/cockroachdb/cockroach/pkg/util/uuid"
 )
 
 var (
 	testKey     = roachpb.Key("a")
 	testTS      = hlc.Timestamp{WallTime: 1, Logical: 1}
 	testPutResp = roachpb.PutResponse{}
-	txnKey      = roachpb.Key("test-txn")
 )
 
 // An example of snowball tracing being used to dump a trace around a
 // transaction. Use something similar whenever you cannot use
-// COCKROACH_TRACE_SQL.
+// sql.trace.txn.threshold.
 func TestTxnSnowballTrace(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 
-	db := NewDB(newTestSender(nil, nil))
-	var collectedSpans []basictracer.RawSpan
-	sp, err := tracing.JoinOrNewSnowball("coordinator", nil, func(sp basictracer.RawSpan) {
-		collectedSpans = append(collectedSpans, sp)
-	})
+	clock := hlc.NewClock(hlc.UnixNano, time.Nanosecond)
+	db := NewDB(newTestTxnFactory(nil), clock)
+	tracer := tracing.NewTracer()
+	ctx, sp, err := tracing.StartSnowballTrace(context.Background(), tracer, "test-txn")
 	if err != nil {
 		t.Fatal(err)
 	}
-	ctx := opentracing.ContextWithSpan(context.TODO(), sp)
-	if err := db.Txn(ctx, func(txn *Txn) error {
-		log.Event(ctx, "collecting spans")
-		collectedSpans = append(collectedSpans, txn.CollectedSpans...)
+
+	if err := db.Txn(ctx, func(ctx context.Context, txn *Txn) error {
+		log.Event(ctx, "inside txn")
 		return nil
 	}); err != nil {
 		t.Fatal(err)
 	}
 	log.Event(ctx, "txn complete")
-	// Cannot use ctx once Finish() is called.
 	sp.Finish()
-	dump := tracing.FormatRawSpans(collectedSpans)
+	collectedSpans := tracing.GetRecording(sp)
+	dump := tracing.FormatRecordedSpans(collectedSpans)
 	// dump:
-	//    0.105ms      0.000ms    event:collecting spans
+	//    0.105ms      0.000ms    event:inside txn
 	//    0.275ms      0.171ms    event:client.Txn did AutoCommit. err: <nil>
 	//txn: "internal/client/txn_test.go:67 TestTxnSnowballTrace" id=<nil> key=/Min rw=false pri=0.00000000 iso=SERIALIZABLE stat=COMMITTED epo=0 ts=0.000000000,0 orig=0.000000000,0 max=0.000000000,0 wto=false rop=false
 	//    0.278ms      0.173ms    event:txn complete
-	found, err := regexp.MatchString(".*event:collecting spans\n.*event:client.Txn did AutoCommit. err: <nil>\n.*\n.*event:txn complete.*", dump)
+	found, err := regexp.MatchString(".*event:inside txn\n.*event:client.Txn did AutoCommit. err: <nil>\n.*\n.*event:txn complete.*", dump)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if !found {
-		t.Fatalf("didnt match: %s", dump)
+		t.Fatalf("didn't match: %s", dump)
 	}
 }
 
-// TestSender mocks out some of the txn coordinator sender's
-// functionality. It responds to PutRequests using testPutResp.
-func newTestSender(
-	pre, post func(roachpb.BatchRequest) (*roachpb.BatchResponse, *roachpb.Error),
-) SenderFunc {
-	txnID := uuid.MakeV4()
-
-	return func(_ context.Context, ba roachpb.BatchRequest) (*roachpb.BatchResponse, *roachpb.Error) {
-		if ba.UserPriority == 0 {
-			ba.UserPriority = 1
-		}
-		if ba.Txn != nil && ba.Txn.ID == nil {
-			ba.Txn.Key = txnKey
-			ba.Txn.ID = &txnID
-		}
-
-		var br *roachpb.BatchResponse
-		var pErr *roachpb.Error
-		if pre != nil {
-			br, pErr = pre(ba)
-		} else {
-			br = ba.CreateReply()
-		}
-		if pErr != nil {
-			return nil, pErr
-		}
-		var writing bool
-		status := roachpb.PENDING
-		for i, req := range ba.Requests {
-			args := req.GetInner()
-			if _, ok := args.(*roachpb.PutRequest); ok {
-				testPutRespCopy := testPutResp
-				union := &br.Responses[i] // avoid operating on copy
-				union.MustSetInner(&testPutRespCopy)
+func newTestTxnFactory(
+	createReply func(roachpb.BatchRequest) (*roachpb.BatchResponse, *roachpb.Error),
+) TxnSenderFactoryFunc {
+	return TxnSenderFactoryFunc(func(_ TxnType) TxnSender {
+		return TxnSenderFunc(func(_ context.Context, ba roachpb.BatchRequest,
+		) (*roachpb.BatchResponse, *roachpb.Error) {
+			if ba.UserPriority == 0 {
+				ba.UserPriority = 1
 			}
-			if roachpb.IsTransactionWrite(args) {
-				writing = true
-			}
-		}
-		if args, ok := ba.GetArg(roachpb.EndTransaction); ok {
-			et := args.(*roachpb.EndTransactionRequest)
-			writing = true
-			if et.Commit {
-				status = roachpb.COMMITTED
+
+			var br *roachpb.BatchResponse
+			var pErr *roachpb.Error
+			if createReply != nil {
+				br, pErr = createReply(ba)
 			} else {
-				status = roachpb.ABORTED
+				br = ba.CreateReply()
 			}
-		}
-		if ba.Txn != nil {
-			txnClone := ba.Txn.Clone()
-			br.Txn = &txnClone
-			if pErr == nil {
-				br.Txn.Writing = writing
-				br.Txn.Status = status
+			if pErr != nil {
+				return nil, pErr
 			}
-		}
-
-		if post != nil {
-			br, pErr = post(ba)
-		}
-		return br, pErr
-	}
+			var writing bool
+			status := roachpb.PENDING
+			for i, req := range ba.Requests {
+				args := req.GetInner()
+				if _, ok := args.(*roachpb.PutRequest); ok {
+					testPutRespCopy := testPutResp
+					union := &br.Responses[i] // avoid operating on copy
+					union.MustSetInner(&testPutRespCopy)
+				}
+				if roachpb.IsTransactionWrite(args) {
+					writing = true
+				}
+			}
+			if args, ok := ba.GetArg(roachpb.EndTransaction); ok {
+				et := args.(*roachpb.EndTransactionRequest)
+				writing = true
+				if et.Commit {
+					status = roachpb.COMMITTED
+				} else {
+					status = roachpb.ABORTED
+				}
+			}
+			if ba.Txn != nil && br.Txn == nil {
+				txnClone := ba.Txn.Clone()
+				br.Txn = &txnClone
+				if pErr == nil {
+					br.Txn.Writing = writing
+					br.Txn.Status = status
+				}
+			}
+			return br, pErr
+		})
+	})
 }
 
 func testPut() roachpb.BatchRequest {
@@ -162,13 +148,14 @@ func TestInitPut(t *testing.T) {
 	// This test is mostly an excuse to exercise otherwise unused code.
 	// TODO(vivekmenezes): update test or remove when InitPut is being
 	// considered sufficiently tested and this path exercised.
-	db := NewDB(newTestSender(func(ba roachpb.BatchRequest) (*roachpb.BatchResponse, *roachpb.Error) {
+	clock := hlc.NewClock(hlc.UnixNano, time.Nanosecond)
+	db := NewDB(newTestTxnFactory(func(ba roachpb.BatchRequest) (*roachpb.BatchResponse, *roachpb.Error) {
 		br := ba.CreateReply()
 		return br, nil
-	}, nil))
+	}), clock)
 
-	txn := NewTxn(context.Background(), *db)
-	if pErr := txn.InitPut("a", "b"); pErr != nil {
+	txn := NewTxn(db, 0 /* gatewayNodeID */, RootTxn)
+	if pErr := txn.InitPut(context.Background(), "a", "b", false); pErr != nil {
 		t.Fatal(pErr)
 	}
 }
@@ -177,60 +164,41 @@ func TestInitPut(t *testing.T) {
 // always upgraded on successive requests.
 func TestTxnRequestTxnTimestamp(t *testing.T) {
 	defer leaktest.AfterTest(t)()
-	makeTS := func(walltime int64, logical int32) hlc.Timestamp {
-		return hlc.ZeroTimestamp.Add(walltime, logical)
-	}
 	ba := testPut()
 
 	testCases := []struct {
 		expRequestTS, responseTS hlc.Timestamp
 	}{
-		{makeTS(0, 0), makeTS(10, 0)},
-		{makeTS(10, 0), makeTS(10, 1)},
-		{makeTS(10, 1), makeTS(10, 0)},
-		{makeTS(10, 1), makeTS(20, 1)},
-		{makeTS(20, 1), makeTS(20, 1)},
-		{makeTS(20, 1), makeTS(0, 0)},
-		{makeTS(20, 1), makeTS(20, 1)},
+		{hlc.Timestamp{WallTime: 5, Logical: 0}, hlc.Timestamp{WallTime: 10, Logical: 0}},
+		{hlc.Timestamp{WallTime: 10, Logical: 0}, hlc.Timestamp{WallTime: 10, Logical: 1}},
+		{hlc.Timestamp{WallTime: 10, Logical: 1}, hlc.Timestamp{WallTime: 10, Logical: 0}},
+		{hlc.Timestamp{WallTime: 10, Logical: 1}, hlc.Timestamp{WallTime: 20, Logical: 1}},
+		{hlc.Timestamp{WallTime: 20, Logical: 1}, hlc.Timestamp{WallTime: 20, Logical: 1}},
+		{hlc.Timestamp{WallTime: 20, Logical: 1}, hlc.Timestamp{WallTime: 19, Logical: 0}},
+		{hlc.Timestamp{WallTime: 20, Logical: 1}, hlc.Timestamp{WallTime: 20, Logical: 1}},
 	}
 
+	manual := hlc.NewManualClock(testCases[0].expRequestTS.WallTime)
+	clock := hlc.NewClock(manual.UnixNano, time.Nanosecond)
 	var testIdx int
-	db := NewDB(newTestSender(nil, func(ba roachpb.BatchRequest) (*roachpb.BatchResponse, *roachpb.Error) {
+	db := NewDB(newTestTxnFactory(func(ba roachpb.BatchRequest) (*roachpb.BatchResponse, *roachpb.Error) {
 		test := testCases[testIdx]
-		if !test.expRequestTS.Equal(ba.Txn.Timestamp) {
+		if test.expRequestTS != ba.Txn.Timestamp {
 			return nil, roachpb.NewErrorf("%d: expected ts %s got %s", testIdx, test.expRequestTS, ba.Txn.Timestamp)
 		}
-		br := &roachpb.BatchResponse{}
-		br.Txn = &roachpb.Transaction{}
-		br.Txn.Update(ba.Txn) // copy
+		br := ba.CreateReply()
+		txnClone := ba.Txn.Clone()
+		br.Txn = &txnClone
 		br.Txn.Timestamp = test.responseTS
 		return br, nil
-	}))
+	}), clock)
 
-	txn := NewTxn(context.Background(), *db)
+	txn := NewTxn(db, 0 /* gatewayNodeID */, RootTxn)
 
 	for testIdx = range testCases {
-		if _, pErr := txn.sendInternal(ba); pErr != nil {
+		if _, pErr := txn.Send(context.Background(), ba); pErr != nil {
 			t.Fatal(pErr)
 		}
-	}
-}
-
-// TestTxnResetTxnOnAbort verifies transaction is reset on abort.
-func TestTxnResetTxnOnAbort(t *testing.T) {
-	defer leaktest.AfterTest(t)()
-	db := NewDB(newTestSender(func(ba roachpb.BatchRequest) (*roachpb.BatchResponse, *roachpb.Error) {
-		return nil, roachpb.NewErrorWithTxn(&roachpb.TransactionAbortedError{}, ba.Txn)
-	}, nil))
-
-	txn := NewTxn(context.Background(), *db)
-	_, pErr := txn.sendInternal(testPut())
-	if _, ok := pErr.GetDetail().(*roachpb.TransactionAbortedError); !ok {
-		t.Fatalf("expected TransactionAbortedError, got %v", pErr)
-	}
-
-	if txn.Proto.ID != nil {
-		t.Errorf("expected txn to be cleared")
 	}
 }
 
@@ -240,10 +208,11 @@ func TestTxnResetTxnOnAbort(t *testing.T) {
 // transactional client.
 func TestTransactionConfig(t *testing.T) {
 	defer leaktest.AfterTest(t)()
+	clock := hlc.NewClock(hlc.UnixNano, time.Nanosecond)
 	dbCtx := DefaultDBContext()
 	dbCtx.UserPriority = 101
-	db := NewDBWithContext(newTestSender(nil, nil), dbCtx)
-	if err := db.Txn(context.TODO(), func(txn *Txn) error {
+	db := NewDBWithContext(newTestTxnFactory(nil), clock, dbCtx)
+	if err := db.Txn(context.TODO(), func(ctx context.Context, txn *Txn) error {
 		if txn.db.ctx.UserPriority != db.ctx.UserPriority {
 			t.Errorf("expected txn user priority %f; got %f",
 				db.ctx.UserPriority, txn.db.ctx.UserPriority)
@@ -259,13 +228,14 @@ func TestTransactionConfig(t *testing.T) {
 // operations were performed.
 func TestCommitReadOnlyTransaction(t *testing.T) {
 	defer leaktest.AfterTest(t)()
+	clock := hlc.NewClock(hlc.UnixNano, time.Nanosecond)
 	var calls []roachpb.Method
-	db := NewDB(newTestSender(func(ba roachpb.BatchRequest) (*roachpb.BatchResponse, *roachpb.Error) {
+	db := NewDB(newTestTxnFactory(func(ba roachpb.BatchRequest) (*roachpb.BatchResponse, *roachpb.Error) {
 		calls = append(calls, ba.Methods()...)
 		return ba.CreateReply(), nil
-	}, nil))
-	if err := db.Txn(context.TODO(), func(txn *Txn) error {
-		_, err := txn.Get("a")
+	}), clock)
+	if err := db.Txn(context.TODO(), func(ctx context.Context, txn *Txn) error {
+		_, err := txn.Get(ctx, "a")
 		return err
 	}); err != nil {
 		t.Errorf("unexpected error on commit: %s", err)
@@ -281,18 +251,19 @@ func TestCommitReadOnlyTransaction(t *testing.T) {
 // that call.
 func TestCommitReadOnlyTransactionExplicit(t *testing.T) {
 	defer leaktest.AfterTest(t)()
+	clock := hlc.NewClock(hlc.UnixNano, time.Nanosecond)
 	for _, withGet := range []bool{true, false} {
 		var calls []roachpb.Method
-		db := NewDB(newTestSender(func(ba roachpb.BatchRequest) (*roachpb.BatchResponse, *roachpb.Error) {
+		db := NewDB(newTestTxnFactory(func(ba roachpb.BatchRequest) (*roachpb.BatchResponse, *roachpb.Error) {
 			calls = append(calls, ba.Methods()...)
 			return ba.CreateReply(), nil
-		}, nil))
-		if err := db.Txn(context.TODO(), func(txn *Txn) error {
+		}), clock)
+		if err := db.Txn(context.TODO(), func(ctx context.Context, txn *Txn) error {
 			b := txn.NewBatch()
 			if withGet {
 				b.Get("foo")
 			}
-			return txn.CommitInBatch(b)
+			return txn.CommitInBatch(ctx, b)
 		}); err != nil {
 			t.Errorf("unexpected error on commit: %s", err)
 		}
@@ -310,9 +281,9 @@ func TestCommitReadOnlyTransactionExplicit(t *testing.T) {
 // upon successful invocation of the retryable func.
 func TestCommitMutatingTransaction(t *testing.T) {
 	defer leaktest.AfterTest(t)()
-
+	clock := hlc.NewClock(hlc.UnixNano, time.Nanosecond)
 	var calls []roachpb.Method
-	db := NewDB(newTestSender(func(ba roachpb.BatchRequest) (*roachpb.BatchResponse, *roachpb.Error) {
+	db := NewDB(newTestTxnFactory(func(ba roachpb.BatchRequest) (*roachpb.BatchResponse, *roachpb.Error) {
 		calls = append(calls, ba.Methods()...)
 		if bt, ok := ba.GetArg(roachpb.BeginTransaction); ok && !bt.Header().Key.Equal(roachpb.Key("a")) {
 			t.Errorf("expected begin transaction key to be \"a\"; got %s", bt.Header().Key)
@@ -321,26 +292,26 @@ func TestCommitMutatingTransaction(t *testing.T) {
 			t.Errorf("expected commit to be true")
 		}
 		return ba.CreateReply(), nil
-	}, nil))
+	}), clock)
 
 	// Test all transactional write methods.
 	testArgs := []struct {
-		f         func(txn *Txn) error
+		f         func(ctx context.Context, txn *Txn) error
 		expMethod roachpb.Method
 	}{
-		{func(txn *Txn) error { return txn.Put("a", "b") }, roachpb.Put},
-		{func(txn *Txn) error { return txn.CPut("a", "b", nil) }, roachpb.ConditionalPut},
-		{func(txn *Txn) error {
-			_, err := txn.Inc("a", 1)
+		{func(ctx context.Context, txn *Txn) error { return txn.Put(ctx, "a", "b") }, roachpb.Put},
+		{func(ctx context.Context, txn *Txn) error { return txn.CPut(ctx, "a", "b", nil) }, roachpb.ConditionalPut},
+		{func(ctx context.Context, txn *Txn) error {
+			_, err := txn.Inc(ctx, "a", 1)
 			return err
 		}, roachpb.Increment},
-		{func(txn *Txn) error { return txn.Del("a") }, roachpb.Delete},
-		{func(txn *Txn) error { return txn.DelRange("a", "b") }, roachpb.DeleteRange},
+		{func(ctx context.Context, txn *Txn) error { return txn.Del(ctx, "a") }, roachpb.Delete},
+		{func(ctx context.Context, txn *Txn) error { return txn.DelRange(ctx, "a", "b") }, roachpb.DeleteRange},
 	}
 	for i, test := range testArgs {
 		calls = []roachpb.Method{}
-		if err := db.Txn(context.TODO(), func(txn *Txn) error {
-			return test.f(txn)
+		if err := db.Txn(context.TODO(), func(ctx context.Context, txn *Txn) error {
+			return test.f(ctx, txn)
 		}); err != nil {
 			t.Errorf("%d: unexpected error on commit: %s", i, err)
 		}
@@ -355,16 +326,17 @@ func TestCommitMutatingTransaction(t *testing.T) {
 // request is inserted just before the first mutating command.
 func TestTxnInsertBeginTransaction(t *testing.T) {
 	defer leaktest.AfterTest(t)()
+	clock := hlc.NewClock(hlc.UnixNano, time.Nanosecond)
 	var calls []roachpb.Method
-	db := NewDB(newTestSender(func(ba roachpb.BatchRequest) (*roachpb.BatchResponse, *roachpb.Error) {
+	db := NewDB(newTestTxnFactory(func(ba roachpb.BatchRequest) (*roachpb.BatchResponse, *roachpb.Error) {
 		calls = append(calls, ba.Methods()...)
 		return ba.CreateReply(), nil
-	}, nil))
-	if err := db.Txn(context.TODO(), func(txn *Txn) error {
-		if _, err := txn.Get("foo"); err != nil {
+	}), clock)
+	if err := db.Txn(context.TODO(), func(ctx context.Context, txn *Txn) error {
+		if _, err := txn.Get(ctx, "foo"); err != nil {
 			return err
 		}
-		return txn.Put("a", "b")
+		return txn.Put(ctx, "a", "b")
 	}); err != nil {
 		t.Errorf("unexpected error on commit: %s", err)
 	}
@@ -378,22 +350,23 @@ func TestTxnInsertBeginTransaction(t *testing.T) {
 // when a BeginTransaction command causes an error.
 func TestBeginTransactionErrorIndex(t *testing.T) {
 	defer leaktest.AfterTest(t)()
-	db := NewDB(newTestSender(func(ba roachpb.BatchRequest) (*roachpb.BatchResponse, *roachpb.Error) {
+	clock := hlc.NewClock(hlc.UnixNano, time.Nanosecond)
+	db := NewDB(newTestTxnFactory(func(ba roachpb.BatchRequest) (*roachpb.BatchResponse, *roachpb.Error) {
 		pErr := roachpb.NewError(&roachpb.WriteIntentError{})
 		pErr.SetErrorIndex(0)
 		return nil, pErr
-	}, nil))
-	_ = db.Txn(context.TODO(), func(txn *Txn) error {
+	}), clock)
+	_ = db.Txn(context.TODO(), func(ctx context.Context, txn *Txn) error {
 		b := txn.NewBatch()
 		b.Put("a", "b")
-		err := getOneErr(txn.Run(b), b)
+		err := getOneErr(txn.Run(ctx, b), b)
 		pErr := b.MustPErr()
 		// Verify that the original error type is preserved, but the error index is unset.
 		if _, ok := pErr.GetDetail().(*roachpb.WriteIntentError); !ok {
 			t.Fatalf("unexpected error %s", pErr)
 		}
 		if pErr.Index != nil {
-			t.Errorf("error index must not be set, but got %s", pErr.Index)
+			t.Errorf("error index must not be set, but got %d", pErr.Index)
 		}
 		return err
 	})
@@ -404,15 +377,16 @@ func TestBeginTransactionErrorIndex(t *testing.T) {
 // ended a second time at completion of retryable func.
 func TestCommitTransactionOnce(t *testing.T) {
 	defer leaktest.AfterTest(t)()
+	clock := hlc.NewClock(hlc.UnixNano, time.Nanosecond)
 	count := 0
-	db := NewDB(newTestSender(func(ba roachpb.BatchRequest) (*roachpb.BatchResponse, *roachpb.Error) {
+	db := NewDB(newTestTxnFactory(func(ba roachpb.BatchRequest) (*roachpb.BatchResponse, *roachpb.Error) {
 		count++
 		return ba.CreateReply(), nil
-	}, nil))
-	if err := db.Txn(context.TODO(), func(txn *Txn) error {
+	}), clock)
+	if err := db.Txn(context.TODO(), func(ctx context.Context, txn *Txn) error {
 		b := txn.NewBatch()
 		b.Put("z", "adding a write exposed a bug in #1882")
-		return txn.CommitInBatch(b)
+		return txn.CommitInBatch(ctx, b)
 	}); err != nil {
 		t.Errorf("unexpected error on commit: %s", err)
 	}
@@ -425,13 +399,14 @@ func TestCommitTransactionOnce(t *testing.T) {
 // transaction does not prompt an EndTransaction call.
 func TestAbortReadOnlyTransaction(t *testing.T) {
 	defer leaktest.AfterTest(t)()
-	db := NewDB(newTestSender(func(ba roachpb.BatchRequest) (*roachpb.BatchResponse, *roachpb.Error) {
+	clock := hlc.NewClock(hlc.UnixNano, time.Nanosecond)
+	db := NewDB(newTestTxnFactory(func(ba roachpb.BatchRequest) (*roachpb.BatchResponse, *roachpb.Error) {
 		if _, ok := ba.GetArg(roachpb.EndTransaction); ok {
 			t.Errorf("did not expect EndTransaction")
 		}
 		return ba.CreateReply(), nil
-	}, nil))
-	if err := db.Txn(context.TODO(), func(txn *Txn) error {
+	}), clock)
+	if err := db.Txn(context.TODO(), func(ctx context.Context, txn *Txn) error {
 		return errors.New("foo")
 	}); err == nil {
 		t.Error("expected error on abort")
@@ -445,23 +420,26 @@ func TestAbortReadOnlyTransaction(t *testing.T) {
 // or not.
 func TestEndWriteRestartReadOnlyTransaction(t *testing.T) {
 	defer leaktest.AfterTest(t)()
+	clock := hlc.NewClock(hlc.UnixNano, time.Nanosecond)
 	for _, success := range []bool{true, false} {
 		expCalls := []roachpb.Method{roachpb.BeginTransaction, roachpb.Put, roachpb.EndTransaction}
 		var calls []roachpb.Method
-		db := NewDB(newTestSender(func(ba roachpb.BatchRequest) (*roachpb.BatchResponse, *roachpb.Error) {
+		db := NewDB(newTestTxnFactory(func(ba roachpb.BatchRequest) (*roachpb.BatchResponse, *roachpb.Error) {
 			calls = append(calls, ba.Methods()...)
 			return ba.CreateReply(), nil
-		}, nil))
+		}), clock)
 		ok := false
-		if err := db.Txn(context.TODO(), func(txn *Txn) error {
+		if err := db.Txn(context.TODO(), func(ctx context.Context, txn *Txn) error {
 			if !ok {
-				if err := txn.Put("consider", "phlebas"); err != nil {
+				if err := txn.Put(ctx, "consider", "phlebas"); err != nil {
 					t.Fatal(err)
 				}
 				ok = true
-				// Return an immediate txn retry error. We need to go through the pErr
-				// and back to get a RetryableTxnError.
-				return roachpb.NewErrorWithTxn(roachpb.NewTransactionRetryError(), &txn.Proto).GoError()
+				// Return an immediate txn retry error.
+				// HACK ALERT: to do without a TxnCoordSender, we jump through hoops to
+				// get the retryable error expected by db.Txn().
+				return roachpb.NewHandledRetryableTxnError(
+					"bogus retryable error", txn.Proto().ID, *txn.Proto())
 			}
 			if !success {
 				return errors.New("aborting on purpose")
@@ -476,52 +454,62 @@ func TestEndWriteRestartReadOnlyTransaction(t *testing.T) {
 	}
 }
 
-// TestTransactionKeyNotChangedInRestart verifies that if the transaction already has a key (we're
-// in a restart), the key in the begin transaction request is not changed.
+// TestTransactionKeyNotChangedInRestart verifies that if the transaction
+// already has a key (we're in a restart), the key in the begin transaction
+// request is not changed.
 func TestTransactionKeyNotChangedInRestart(t *testing.T) {
 	defer leaktest.AfterTest(t)()
-	tries := 0
-	db := NewDB(newTestSender(nil, func(ba roachpb.BatchRequest) (*roachpb.BatchResponse, *roachpb.Error) {
-		var bt *roachpb.BeginTransactionRequest
-		if args, ok := ba.GetArg(roachpb.BeginTransaction); ok {
-			bt = args.(*roachpb.BeginTransactionRequest)
-		} else {
-			t.Fatal("failed to find a begin transaction request")
+
+	clock := hlc.NewClock(hlc.UnixNano, time.Nanosecond)
+	attempt := 0
+	keys := []string{"first", "second"}
+	db := NewDB(newTestTxnFactory(func(ba roachpb.BatchRequest) (*roachpb.BatchResponse, *roachpb.Error) {
+		// Ignore the final EndTxnRequest.
+		if _, ok := ba.GetArg(roachpb.EndTransaction); ok {
+			return ba.CreateReply(), nil
 		}
 
-		// In the first try, the transaction key is the key of the first write command. Before the
-		// second try, the transaction key is set to txnKey by the test sender. In the second try, the
-		// transaction key is txnKey.
-		var expectedKey roachpb.Key
-		if tries == 1 {
-			expectedKey = testKey
-		} else {
-			expectedKey = txnKey
+		// Attempt 0 should have a BeginTxnRequest, and a PutRequest.
+		// Attempt 1 should have a PutRequest.
+		if attempt == 0 {
+			if _, ok := ba.GetArg(roachpb.BeginTransaction); !ok {
+				t.Fatalf("failed to find a begin transaction request: %v", ba)
+			}
 		}
-		if !bt.Key.Equal(expectedKey) {
-			t.Fatalf("expected transaction key %v, got %v", expectedKey, bt.Key)
+		if _, ok := ba.GetArg(roachpb.Put); !ok {
+			t.Fatalf("failed to find a put request: %v", ba)
 		}
 
+		// In the first attempt, the transaction key is the key of the first write command.
+		// This key is retained between restarts, so we see the same key in the second attempt.
+		if expectedKey := []byte(keys[0]); !bytes.Equal(expectedKey, ba.Txn.Key) {
+			t.Fatalf("expected transaction key %v, got %v", expectedKey, ba.Txn.Key)
+		}
+
+		if attempt == 0 {
+			// Abort the first attempt so that we need to retry with
+			// a new transaction proto.
+			//
+			// HACK ALERT: to do without a TxnCoordSender, we jump through hoops to
+			// get the retryable error expected by db.Txn().
+			return nil, roachpb.NewError(
+				roachpb.NewHandledRetryableTxnError(
+					"bogus retryable error", ba.Txn.ID, *ba.Txn))
+		}
 		return ba.CreateReply(), nil
-	}))
+	}), clock)
 
-	if err := db.Txn(context.TODO(), func(txn *Txn) error {
-		tries++
+	if err := db.Txn(context.TODO(), func(ctx context.Context, txn *Txn) error {
+		defer func() { attempt++ }()
 		b := txn.NewBatch()
-		b.Put("a", "b")
-		if err := txn.Run(b); err != nil {
-			t.Fatal(err)
-		}
-		if tries == 1 {
-			return roachpb.NewErrorWithTxn(roachpb.NewTransactionRetryError(), &txn.Proto).GoError()
-		}
-		return nil
+		b.Put(keys[attempt], "b")
+		return txn.Run(ctx, b)
 	}); err != nil {
 		t.Errorf("unexpected error on commit: %s", err)
 	}
-	minimumTries := 2
-	if tries < minimumTries {
-		t.Errorf("expected try count >= %d, got %d", minimumTries, tries)
+	minimumAttempts := 2
+	if attempt < minimumAttempts {
+		t.Errorf("expected attempt count >= %d, got %d", minimumAttempts, attempt)
 	}
 }
 
@@ -529,17 +517,18 @@ func TestTransactionKeyNotChangedInRestart(t *testing.T) {
 // upon failed invocation of the retryable func.
 func TestAbortMutatingTransaction(t *testing.T) {
 	defer leaktest.AfterTest(t)()
+	clock := hlc.NewClock(hlc.UnixNano, time.Nanosecond)
 	var calls []roachpb.Method
-	db := NewDB(newTestSender(func(ba roachpb.BatchRequest) (*roachpb.BatchResponse, *roachpb.Error) {
+	db := NewDB(newTestTxnFactory(func(ba roachpb.BatchRequest) (*roachpb.BatchResponse, *roachpb.Error) {
 		calls = append(calls, ba.Methods()...)
 		if et, ok := ba.GetArg(roachpb.EndTransaction); ok && et.(*roachpb.EndTransactionRequest).Commit {
 			t.Errorf("expected commit to be false")
 		}
 		return ba.CreateReply(), nil
-	}, nil))
+	}), clock)
 
-	if err := db.Txn(context.TODO(), func(txn *Txn) error {
-		if err := txn.Put("a", "b"); err != nil {
+	if err := db.Txn(context.TODO(), func(ctx context.Context, txn *Txn) error {
+		if err := txn.Put(ctx, "a", "b"); err != nil {
 			return err
 		}
 		return errors.Errorf("foo")
@@ -554,13 +543,18 @@ func TestAbortMutatingTransaction(t *testing.T) {
 
 // TestRunTransactionRetryOnErrors verifies that the transaction
 // is retried on the correct errors.
+//
+// TODO(andrei): This test is probably not actually testing much, the mock
+// sender implementation recognizes the retryable errors. We should give this
+// test a TxnCoordSender instead.
 func TestRunTransactionRetryOnErrors(t *testing.T) {
 	defer leaktest.AfterTest(t)()
+	clock := hlc.NewClock(hlc.UnixNano, time.Nanosecond)
 	testCases := []struct {
 		err   error
 		retry bool // Expect retry?
 	}{
-		{roachpb.NewReadWithinUncertaintyIntervalError(hlc.ZeroTimestamp, hlc.ZeroTimestamp), true},
+		{roachpb.NewReadWithinUncertaintyIntervalError(hlc.Timestamp{}, hlc.Timestamp{}, nil), true},
 		{&roachpb.TransactionAbortedError{}, true},
 		{&roachpb.TransactionPushError{}, true},
 		{&roachpb.TransactionRetryError{}, true},
@@ -570,136 +564,56 @@ func TestRunTransactionRetryOnErrors(t *testing.T) {
 		{&roachpb.TransactionStatusError{}, false},
 	}
 
-	for i, test := range testCases {
-		count := 0
-		dbCtx := DefaultDBContext()
-		dbCtx.TxnRetryOptions.InitialBackoff = 1 * time.Millisecond
-		db := NewDBWithContext(newTestSender(
-			func(ba roachpb.BatchRequest) (*roachpb.BatchResponse, *roachpb.Error) {
-
-				if _, ok := ba.GetArg(roachpb.Put); ok {
-					count++
-					if count == 1 {
-						return nil, roachpb.NewErrorWithTxn(test.err, ba.Txn)
-					}
-				}
-				return ba.CreateReply(), nil
-			}, nil), dbCtx)
-		err := db.Txn(context.TODO(), func(txn *Txn) error {
-			return txn.Put("a", "b")
-		})
-		if test.retry {
-			if count != 2 {
-				t.Errorf("%d: expected one retry; got %d", i, count-1)
-			}
-			if err != nil {
-				t.Errorf("%d: expected success on retry; got %s", i, err)
-			}
-		} else {
-			if count != 1 {
-				t.Errorf("%d: expected no retries; got %d", i, count)
-			}
-			if reflect.TypeOf(err) != reflect.TypeOf(test.err) {
-				t.Errorf("%d: expected error of type %T; got %T", i, test.err, err)
-			}
-		}
-	}
-}
-
-// Test that the a txn gets a fresh OrigTimestamp with every retry.
-func TestAbortedRetryRenewsTimestamp(t *testing.T) {
-	defer leaktest.AfterTest(t)()
-
-	// Create a TestSender that aborts a transaction 2 times before succeeding.
-	mc := hlc.NewManualClock(123)
-	clock := hlc.NewClock(mc.UnixNano, time.Nanosecond)
-	count := 0
-	db := NewDB(newTestSender(func(ba roachpb.BatchRequest) (*roachpb.BatchResponse, *roachpb.Error) {
-		if _, ok := ba.GetArg(roachpb.Put); ok {
-			mc.Increment(1)
-			count++
-			if count < 3 {
-				return nil, roachpb.NewError(&roachpb.TransactionAbortedError{})
-			}
-		}
-		return ba.CreateReply(), nil
-	}, nil))
-
-	txnClosure := func(txn *Txn, opt *TxnExecOptions) error {
-		// Ensure the KV transaction is created.
-		return txn.Put("a", "b")
-	}
-
-	txn := NewTxn(context.Background(), *db)
-
-	// Request a client-defined timestamp.
-	refTimestamp := clock.Now()
-	execOpt := TxnExecOptions{
-		AutoRetry:  true,
-		AutoCommit: true,
-		Clock:      clock,
-	}
-
-	// Perform the transaction.
-	if err := txn.Exec(execOpt, txnClosure); err != nil {
-		t.Fatal(err)
-	}
-
-	// Check the timestamp was preserved.
-	if txn.Proto.OrigTimestamp.WallTime == refTimestamp.WallTime {
-		t.Errorf("expected txn orig ts to be different than %s", refTimestamp)
-	}
-}
-
-// TestAbortTransactionOnCommitErrors verifies that transactions are
-// aborted on the correct errors.
-func TestAbortTransactionOnCommitErrors(t *testing.T) {
-	defer leaktest.AfterTest(t)()
-
-	testCases := []struct {
-		err   error
-		abort bool
-	}{
-		{roachpb.NewReadWithinUncertaintyIntervalError(hlc.ZeroTimestamp, hlc.ZeroTimestamp), true},
-		{&roachpb.TransactionAbortedError{}, false},
-		{&roachpb.TransactionPushError{}, true},
-		{&roachpb.TransactionRetryError{}, true},
-		{&roachpb.RangeNotFoundError{}, true},
-		{&roachpb.RangeKeyMismatchError{}, true},
-		{&roachpb.TransactionStatusError{}, true},
-	}
-
 	for _, test := range testCases {
-		var commit, abort bool
-		db := NewDB(newTestSender(func(ba roachpb.BatchRequest) (*roachpb.BatchResponse, *roachpb.Error) {
+		t.Run(fmt.Sprintf("%T", test.err), func(t *testing.T) {
+			count := 0
+			db := NewDB(newTestTxnFactory(
+				func(ba roachpb.BatchRequest) (*roachpb.BatchResponse, *roachpb.Error) {
 
-			switch t := ba.Requests[0].GetInner().(type) {
-			case *roachpb.EndTransactionRequest:
-				if t.Commit {
-					commit = true
-					return nil, roachpb.NewError(test.err)
+					if _, ok := ba.GetArg(roachpb.Put); ok {
+						count++
+						if count == 1 {
+							var pErr *roachpb.Error
+							if _, ok := test.err.(*roachpb.ReadWithinUncertaintyIntervalError); ok {
+								// This error requires an observed timestamp to have been
+								// recorded on the origin node.
+								ba.Txn.UpdateObservedTimestamp(1, hlc.Timestamp{WallTime: 1, Logical: 1})
+								pErr = roachpb.NewErrorWithTxn(test.err, ba.Txn)
+								pErr.OriginNode = 1
+							} else {
+								pErr = roachpb.NewErrorWithTxn(test.err, ba.Txn)
+							}
+
+							if pErr.TransactionRestart != roachpb.TransactionRestart_NONE {
+								// HACK ALERT: to do without a TxnCoordSender, we jump through
+								// hoops to get the retryable error expected by db.Txn().
+								return nil, roachpb.NewError(roachpb.NewHandledRetryableTxnError(
+									pErr.Message, ba.Txn.ID, *ba.Txn))
+							}
+							return nil, pErr
+						}
+					}
+					return ba.CreateReply(), nil
+				}), clock)
+			err := db.Txn(context.TODO(), func(ctx context.Context, txn *Txn) error {
+				return txn.Put(ctx, "a", "b")
+			})
+			if test.retry {
+				if err != nil {
+					t.Fatalf("expected success on retry; got %s", err)
 				}
-				abort = true
+				if count != 2 {
+					t.Fatalf("expected one retry; got %d", count-1)
+				}
+			} else {
+				if count != 1 {
+					t.Errorf("expected no retries; got %d", count)
+				}
+				if reflect.TypeOf(err) != reflect.TypeOf(test.err) {
+					t.Errorf("expected error of type %T; got %T", test.err, err)
+				}
 			}
-			return ba.CreateReply(), nil
-		}, nil))
-
-		txn := NewTxn(context.Background(), *db)
-		if pErr := txn.Put("a", "b"); pErr != nil {
-			t.Fatalf("put failed: %s", pErr)
-		}
-		if pErr := txn.CommitOrCleanup(); pErr == nil {
-			t.Fatalf("unexpected commit success")
-		}
-
-		if !commit {
-			t.Errorf("%T: failed to find commit", test.err)
-		}
-		if test.abort && !abort {
-			t.Errorf("%T: failed to find abort", test.err)
-		} else if !test.abort && abort {
-			t.Errorf("%T: found unexpected abort", test.err)
-		}
+		})
 	}
 }
 
@@ -708,31 +622,32 @@ func TestAbortTransactionOnCommitErrors(t *testing.T) {
 func TestTransactionStatus(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 
-	db := NewDB(newTestSender(nil, nil))
+	clock := hlc.NewClock(hlc.UnixNano, time.Nanosecond)
+	db := NewDB(newTestTxnFactory(nil), clock)
 	for _, write := range []bool{true, false} {
 		for _, commit := range []bool{true, false} {
-			txn := NewTxn(context.Background(), *db)
+			txn := NewTxn(db, 0 /* gatewayNodeID */, RootTxn)
 
-			if _, pErr := txn.Get("a"); pErr != nil {
+			if _, pErr := txn.Get(context.Background(), "a"); pErr != nil {
 				t.Fatal(pErr)
 			}
 			if write {
-				if pErr := txn.Put("a", "b"); pErr != nil {
+				if pErr := txn.Put(context.Background(), "a", "b"); pErr != nil {
 					t.Fatal(pErr)
 				}
 			}
 			if commit {
-				if pErr := txn.CommitOrCleanup(); pErr != nil {
+				if pErr := txn.CommitOrCleanup(context.Background()); pErr != nil {
 					t.Fatal(pErr)
 				}
-				if a, e := txn.Proto.Status, roachpb.COMMITTED; a != e {
+				if a, e := txn.Proto().Status, roachpb.COMMITTED; a != e {
 					t.Errorf("write: %t, commit: %t transaction expected to have status %q but had %q", write, commit, e, a)
 				}
 			} else {
-				if pErr := txn.Rollback(); pErr != nil {
+				if pErr := txn.Rollback(context.Background()); pErr != nil {
 					t.Fatal(pErr)
 				}
-				if a, e := txn.Proto.Status, roachpb.ABORTED; a != e {
+				if a, e := txn.Proto().Status, roachpb.ABORTED; a != e {
 					t.Errorf("write: %t, commit: %t transaction expected to have status %q but had %q", write, commit, e, a)
 				}
 			}
@@ -742,15 +657,16 @@ func TestTransactionStatus(t *testing.T) {
 
 func TestCommitInBatchWrongTxn(t *testing.T) {
 	defer leaktest.AfterTest(t)()
-	db := NewDB(newTestSender(nil, nil))
-	txn := NewTxn(context.Background(), *db)
+	clock := hlc.NewClock(hlc.UnixNano, time.Nanosecond)
+	db := NewDB(newTestTxnFactory(nil), clock)
+	txn := NewTxn(db, 0 /* gatewayNodeID */, RootTxn)
 
 	b1 := &Batch{}
-	txn2 := NewTxn(context.Background(), *db)
+	txn2 := NewTxn(db, 0 /* gatewayNodeID */, RootTxn)
 	b2 := txn2.NewBatch()
 
 	for _, b := range []*Batch{b1, b2} {
-		if err := txn.CommitInBatch(b); !testutils.IsError(err, "can only be committed by") {
+		if err := txn.CommitInBatch(context.Background(), b); !testutils.IsError(err, "can only be committed by") {
 			t.Error(err)
 		}
 	}
@@ -760,28 +676,25 @@ func TestCommitInBatchWrongTxn(t *testing.T) {
 // Txn timestamp using client.TxnExecOptions.
 func TestTimestampSelectionInOptions(t *testing.T) {
 	defer leaktest.AfterTest(t)()
-	db := NewDB(newTestSender(nil, nil))
-	txn := NewTxn(context.Background(), *db)
-
 	mc := hlc.NewManualClock(100)
 	clock := hlc.NewClock(mc.UnixNano, time.Nanosecond)
-	execOpt := TxnExecOptions{
-		Clock: clock,
-	}
+	db := NewDB(newTestTxnFactory(nil), clock)
+	txn := NewTxn(db, 0 /* gatewayNodeID */, RootTxn)
+
 	refTimestamp := clock.Now()
 
-	txnClosure := func(txn *Txn, opt *TxnExecOptions) error {
+	txnClosure := func(ctx context.Context, txn *Txn, opt *TxnExecOptions) error {
 		// Ensure the KV transaction is created.
-		return txn.Put("a", "b")
+		return txn.Put(ctx, "a", "b")
 	}
 
-	if err := txn.Exec(execOpt, txnClosure); err != nil {
+	if err := txn.Exec(context.Background(), TxnExecOptions{}, txnClosure); err != nil {
 		t.Fatal(err)
 	}
 
 	// Check the timestamp was initialized.
-	if txn.Proto.OrigTimestamp.WallTime != refTimestamp.WallTime {
-		t.Errorf("expected txn orig ts to be %s; got %s", refTimestamp, txn.Proto.OrigTimestamp)
+	if txn.Proto().OrigTimestamp.WallTime != refTimestamp.WallTime {
+		t.Errorf("expected txn orig ts to be %s; got %s", refTimestamp, txn.Proto().OrigTimestamp)
 	}
 }
 
@@ -790,9 +703,9 @@ func TestTimestampSelectionInOptions(t *testing.T) {
 func TestSetPriority(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 
+	clock := hlc.NewClock(hlc.UnixNano, time.Nanosecond)
 	var expected roachpb.UserPriority
-
-	db := NewDB(newTestSender(
+	db := NewDB(newTestTxnFactory(
 		func(ba roachpb.BatchRequest) (*roachpb.BatchResponse, *roachpb.Error) {
 			if ba.UserPriority != expected {
 				pErr := roachpb.NewErrorf("Priority not set correctly in the batch! "+
@@ -804,23 +717,23 @@ func TestSetPriority(t *testing.T) {
 			br.Txn = &roachpb.Transaction{}
 			br.Txn.Update(ba.Txn) // copy
 			return br, nil
-		}, nil))
+		}), clock)
 
 	// Verify the normal priority setting path.
-	expected = roachpb.HighUserPriority
-	txn := NewTxn(context.Background(), *db)
+	expected = roachpb.NormalUserPriority
+	txn := NewTxn(db, 0 /* gatewayNodeID */, RootTxn)
 	if err := txn.SetUserPriority(expected); err != nil {
 		t.Fatal(err)
 	}
-	if _, pErr := txn.sendInternal(roachpb.BatchRequest{}); pErr != nil {
+	if _, pErr := txn.Send(context.Background(), roachpb.BatchRequest{}); pErr != nil {
 		t.Fatal(pErr)
 	}
 
 	// Verify the internal (fixed value) priority setting path.
 	expected = roachpb.UserPriority(-13)
-	txn = NewTxn(context.Background(), *db)
+	txn = NewTxn(db, 0 /* gatewayNodeID */, RootTxn)
 	txn.InternalSetPriority(13)
-	if _, pErr := txn.sendInternal(roachpb.BatchRequest{}); pErr != nil {
+	if _, pErr := txn.Send(context.Background(), roachpb.BatchRequest{}); pErr != nil {
 		t.Fatal(pErr)
 	}
 }
@@ -829,32 +742,39 @@ func TestSetPriority(t *testing.T) {
 // be retried.
 func TestWrongTxnRetry(t *testing.T) {
 	defer leaktest.AfterTest(t)()
-	db := NewDB(newTestSender(nil, nil))
+	clock := hlc.NewClock(hlc.UnixNano, time.Nanosecond)
+	db := NewDB(newTestTxnFactory(nil), clock)
 
 	var retries int
-	txnClosure := func(outerTxn *Txn) error {
-		log.Infof(context.Background(), "outer retry")
+	txnClosure := func(ctx context.Context, outerTxn *Txn) error {
+		log.Infof(ctx, "outer retry")
 		retries++
 		// Ensure the KV transaction is created.
-		if err := outerTxn.Put("a", "b"); err != nil {
+		if err := outerTxn.Put(ctx, "a", "b"); err != nil {
 			t.Fatal(err)
 		}
 		var execOpt TxnExecOptions
 		execOpt.AutoRetry = false
-		err := outerTxn.Exec(
-			execOpt,
-			func(innerTxn *Txn, opt *TxnExecOptions) error {
-				// Ensure the KV transaction is created.
-				if err := innerTxn.Put("x", "y"); err != nil {
-					t.Fatal(err)
-				}
-				return roachpb.NewErrorWithTxn(&roachpb.TransactionPushError{
-					PusheeTxn: outerTxn.Proto}, &innerTxn.Proto).GoError()
-			})
+		innerClosure := func(ctx context.Context, innerTxn *Txn, opt *TxnExecOptions) error {
+			log.Infof(ctx, "starting inner: %s", innerTxn.Proto())
+			// Ensure the KV transaction is created.
+			if err := innerTxn.Put(ctx, "x", "y"); err != nil {
+				t.Fatal(err)
+			}
+			// HACK ALERT: to do without a TxnCoordSender, we jump through hoops to
+			// get the retryable error expected by txn.Exec().
+			return roachpb.NewHandledRetryableTxnError(
+				"test error", innerTxn.Proto().ID, *innerTxn.Proto())
+		}
+		innerTxn := NewTxn(db, 0 /* gatewayNodeID */, RootTxn)
+		err := innerTxn.Exec(ctx, execOpt, innerClosure)
+		if !testutils.IsError(err, "test error") {
+			t.Fatalf("unexpected inner failure: %v", err)
+		}
 		return err
 	}
 
-	if err := db.Txn(context.TODO(), txnClosure); !testutils.IsError(err, "failed to push") {
+	if err := db.Txn(context.TODO(), txnClosure); !testutils.IsError(err, "test error") {
 		t.Fatal(err)
 	}
 	if retries != 1 {
@@ -864,7 +784,8 @@ func TestWrongTxnRetry(t *testing.T) {
 
 func TestBatchMixRawRequest(t *testing.T) {
 	defer leaktest.AfterTest(t)()
-	db := NewDB(newTestSender(nil, nil))
+	clock := hlc.NewClock(hlc.UnixNano, time.Nanosecond)
+	db := NewDB(newTestTxnFactory(nil), clock)
 
 	b := &Batch{}
 	b.AddRawRequest(&roachpb.EndTransactionRequest{})
@@ -876,34 +797,79 @@ func TestBatchMixRawRequest(t *testing.T) {
 
 func TestUpdateDeadlineMaybe(t *testing.T) {
 	defer leaktest.AfterTest(t)()
-	db := NewDB(newTestSender(nil, nil))
-	txn := NewTxn(context.Background(), *db)
+	mc := hlc.NewManualClock(1)
+	clock := hlc.NewClock(mc.UnixNano, time.Nanosecond)
+	db := NewDB(TxnSenderFactoryFunc(func(_ TxnType) TxnSender { return nil }), clock)
+	txn := NewTxn(db, 0 /* gatewayNodeID */, RootTxn)
 
 	if txn.deadline != nil {
 		t.Errorf("unexpected initial deadline: %s", txn.deadline)
 	}
 
 	deadline := hlc.Timestamp{WallTime: 10, Logical: 1}
-	if !txn.UpdateDeadlineMaybe(deadline) {
+	if !txn.UpdateDeadlineMaybe(context.TODO(), deadline) {
 		t.Errorf("expected update, but it didn't happen")
 	}
-	if !txn.deadline.Equal(deadline) {
-		t.Errorf("unexpected deadline: %s", txn.deadline)
+	if d := *txn.deadline; d != deadline {
+		t.Errorf("unexpected deadline: %s", d)
 	}
 
 	futureDeadline := hlc.Timestamp{WallTime: 11, Logical: 1}
-	if txn.UpdateDeadlineMaybe(futureDeadline) {
+	if txn.UpdateDeadlineMaybe(context.TODO(), futureDeadline) {
 		t.Errorf("expected no update, but update happened")
 	}
-	if !txn.deadline.Equal(deadline) {
-		t.Errorf("unexpected deadline: %s", txn.deadline)
+	if d := *txn.deadline; d != deadline {
+		t.Errorf("unexpected deadline: %s", d)
 	}
 
 	pastDeadline := hlc.Timestamp{WallTime: 9, Logical: 1}
-	if !txn.UpdateDeadlineMaybe(pastDeadline) {
+	if !txn.UpdateDeadlineMaybe(context.TODO(), pastDeadline) {
 		t.Errorf("expected update, but it didn't happen")
 	}
-	if !txn.deadline.Equal(pastDeadline) {
-		t.Errorf("unexpected deadline: %s", txn.deadline)
+	if d := *txn.deadline; d != pastDeadline {
+		t.Errorf("unexpected deadline: %s", d)
+	}
+}
+
+// TestConcurrentTxnRequests verifies that multiple requests can be executed on
+// a transaction at the same time from multiple goroutines. It makes sure that
+// exactly one BeginTxnRequest and one EndTxnRequest are sent.
+func TestConcurrentTxnRequests(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+
+	clock := hlc.NewClock(hlc.UnixNano, time.Nanosecond)
+	var callCountsMu syncutil.Mutex
+	callCounts := make(map[roachpb.Method]int)
+	db := NewDB(newTestTxnFactory(func(ba roachpb.BatchRequest) (*roachpb.BatchResponse, *roachpb.Error) {
+		callCountsMu.Lock()
+		for _, m := range ba.Methods() {
+			callCounts[m]++
+		}
+		callCountsMu.Unlock()
+		return ba.CreateReply(), nil
+	}), clock)
+
+	const keys = "abcdefghijklmnopqrstuvwxyz"
+	const value = "value"
+	if err := db.Txn(context.TODO(), func(ctx context.Context, txn *Txn) error {
+		g, gCtx := errgroup.WithContext(ctx)
+		for _, keyChar := range keys {
+			key := string(keyChar)
+			g.Go(func() error {
+				return txn.Put(gCtx, key, value)
+			})
+		}
+		return g.Wait()
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	expectedCallCounts := map[roachpb.Method]int{
+		roachpb.BeginTransaction: 1,
+		roachpb.Put:              26,
+		roachpb.EndTransaction:   1,
+	}
+	if !reflect.DeepEqual(expectedCallCounts, callCounts) {
+		t.Errorf("expected %v, got %v", expectedCallCounts, callCounts)
 	}
 }

@@ -11,19 +11,16 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
 // implied. See the License for the specific language governing
 // permissions and limitations under the License.
-//
-// Author: Spencer Kimball (spencer.kimball@gmail.com)
 
 package gossip
 
 import (
 	"bytes"
+	"context"
 	"fmt"
 	"math"
 	"regexp"
 	"time"
-
-	"golang.org/x/net/context"
 
 	"github.com/pkg/errors"
 
@@ -143,8 +140,8 @@ func newInfoStore(
 	}
 }
 
-// newInfo allocates and returns a new info object using specified key,
-// value, and time-to-live.
+// newInfo allocates and returns a new info object using the specified
+// value and time-to-live.
 func (is *infoStore) newInfo(val []byte, ttl time.Duration) *Info {
 	nodeID := is.nodeID.Get()
 	if nodeID == 0 {
@@ -168,7 +165,7 @@ func (is *infoStore) newInfo(val []byte, ttl time.Duration) *Info {
 func (is *infoStore) getInfo(key string) *Info {
 	if info, ok := is.Infos[key]; ok {
 		// Check TTL and discard if too old.
-		if info.expired(timeutil.Now().UnixNano()) {
+		if info.expired(monotonicUnixNano()) {
 			delete(is.Infos, key)
 		} else {
 			return info
@@ -197,7 +194,8 @@ func (is *infoStore) addInfo(key string, i *Info) error {
 		i.Value.InitChecksum([]byte(key))
 		i.OrigStamp = monotonicUnixNano()
 		if highWaterStamp, ok := is.highWaterStamps[i.NodeID]; ok && highWaterStamp >= i.OrigStamp {
-			panic(errors.Errorf("high water stamp %d >= %d", highWaterStamp, i.OrigStamp))
+			// Report both timestamps in the crash.
+			log.Fatal(context.Background(), log.Safe(fmt.Sprintf("high water stamp %d >= %d", highWaterStamp, i.OrigStamp)))
 		}
 	}
 	// Update info map.
@@ -258,7 +256,7 @@ func (is *infoStore) registerCallback(pattern string, method Callback) func() {
 }
 
 // processCallbacks processes callbacks for the specified key by
-// matching callback regular expression against the key and invoking
+// matching each callback's regular expression against the key and invoking
 // the corresponding callback method on a match.
 func (is *infoStore) processCallbacks(key string, content roachpb.Value) {
 	var matches []Callback
@@ -284,21 +282,23 @@ func (is *infoStore) runCallbacks(key string, content roachpb.Value, callbacks .
 	// Run callbacks in a goroutine to avoid mutex reentry. We also guarantee
 	// callbacks are run in order such that if a key is updated twice in
 	// succession, the second callback will never be run before the first.
-	if err := is.stopper.RunAsyncTask(context.Background(), func(_ context.Context) {
-		// Grab the callback mutex to serialize execution of the callbacks.
-		is.callbackMu.Lock()
-		defer is.callbackMu.Unlock()
+	if err := is.stopper.RunAsyncTask(
+		context.Background(), "gossip.infoStore: callback", func(_ context.Context,
+		) {
+			// Grab the callback mutex to serialize execution of the callbacks.
+			is.callbackMu.Lock()
+			defer is.callbackMu.Unlock()
 
-		// Grab and execute the list of work.
-		is.callbackWorkMu.Lock()
-		work := is.callbackWork
-		is.callbackWork = nil
-		is.callbackWorkMu.Unlock()
+			// Grab and execute the list of work.
+			is.callbackWorkMu.Lock()
+			work := is.callbackWork
+			is.callbackWork = nil
+			is.callbackWorkMu.Unlock()
 
-		for _, w := range work {
-			w()
-		}
-	}); err != nil {
+			for _, w := range work {
+				w()
+			}
+		}); err != nil {
 		ctx := is.AnnotateCtx(context.TODO())
 		log.Warning(ctx, err)
 	}
@@ -308,7 +308,7 @@ func (is *infoStore) runCallbacks(key string, content roachpb.Value, callbacks .
 // function against each info in turn. Be sure to skip over any expired
 // infos.
 func (is *infoStore) visitInfos(visitInfo func(string, *Info) error) error {
-	now := timeutil.Now().UnixNano()
+	now := monotonicUnixNano()
 
 	if visitInfo != nil {
 		for k, i := range is.Infos {
@@ -336,11 +336,11 @@ func (is *infoStore) combine(
 		infoCopy := *i
 		infoCopy.Hops++
 		infoCopy.PeerID = nodeID
-		// Errors from addInfo here are not a problem; they simply
-		// indicate that the data in *is is newer than in *delta.
 		if infoCopy.OrigStamp == 0 {
 			panic(errors.Errorf("combining info from node %d with 0 original timestamp", nodeID))
 		}
+		// errNotFresh errors from addInfo are ignored; they indicate that
+		// the data in *is is newer than in *delta.
 		if addErr := is.addInfo(key, &infoCopy); addErr == nil {
 			freshCount++
 		} else if addErr != errNotFresh {
@@ -369,13 +369,26 @@ func (is *infoStore) delta(highWaterTimestamps map[roachpb.NodeID]int64) map[str
 	return infos
 }
 
-// mostDistant returns the most distant gossip node known to the
-// store as well as the number of hops to reach it.
-func (is *infoStore) mostDistant() (roachpb.NodeID, uint32) {
+// mostDistant returns the most distant gossip node known to the store
+// as well as the number of hops to reach it.
+//
+// Uses haveOutgoingConn to check for whether or not this node is already
+// in the process of connecting to a given node (but haven't yet received
+// Infos from it) for the purposes of excluding them from the result.
+// This check is particularly useful if mostDistant is called multiple times
+// in quick succession.
+func (is *infoStore) mostDistant(
+	hasOutgoingConn func(roachpb.NodeID) bool,
+) (roachpb.NodeID, uint32) {
 	var nodeID roachpb.NodeID
 	var maxHops uint32
 	if err := is.visitInfos(func(key string, i *Info) error {
-		if i.Hops > maxHops {
+		// Only consider NodeID keys here because they're re-gossiped every time a
+		// node restarts and periodically after that, so their Hops values are more
+		// likely to be accurate than keys which are rarely re-gossiped, which can
+		// acquire unreliably high Hops values in some pathological cases such as
+		// those described in #9819.
+		if i.Hops > maxHops && IsNodeIDKey(key) && !hasOutgoingConn(i.NodeID) {
 			maxHops = i.Hops
 			nodeID = i.NodeID
 		}

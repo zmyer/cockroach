@@ -11,8 +11,6 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
 // implied. See the License for the specific language governing
 // permissions and limitations under the License.
-//
-// Author: Nathan VanBenschoten (nvanbenschoten@gmail.com)
 
 package pgerror
 
@@ -99,6 +97,7 @@ const (
 	CodeNullValueNotAllowedError                   = "22004"
 	CodeNullValueNoIndicatorParameterError         = "22002"
 	CodeNumericValueOutOfRangeError                = "22003"
+	CodeSequenceGeneratorLimitExceeded             = "2200H"
 	CodeStringDataLengthMismatchError              = "22026"
 	CodeStringDataRightTruncationError             = "22001"
 	CodeSubstringError                             = "22011"

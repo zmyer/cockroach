@@ -11,23 +11,20 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
 // implied. See the License for the specific language governing
 // permissions and limitations under the License.
-//
-// Author: Andrei Matei (andreimatei1@gmail.com)
 
 package distsqlplan_test
 
 import (
+	"context"
 	gosql "database/sql"
 	"fmt"
 	"testing"
 	"time"
 
 	"github.com/pkg/errors"
-	"golang.org/x/net/context"
 
 	"github.com/cockroachdb/cockroach/pkg/base"
 	"github.com/cockroachdb/cockroach/pkg/internal/client"
-	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/kv"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/server"
@@ -44,6 +41,7 @@ import (
 // state of caches.
 func TestSpanResolverUsesCaches(t *testing.T) {
 	defer leaktest.AfterTest(t)()
+	t.Skip("#13525")
 	tc := testcluster.StartTestCluster(t, 4,
 		base.TestClusterArgs{
 			ReplicationMode: base.ReplicationManual,
@@ -51,10 +49,10 @@ func TestSpanResolverUsesCaches(t *testing.T) {
 				UseDatabase: "t",
 			},
 		})
-	defer tc.Stopper().Stop()
+	defer tc.Stopper().Stop(context.TODO())
 
 	rowRanges, _ := setupRanges(
-		tc.Conns[0], tc.Servers[0], tc.Servers[0].KVClient().(*client.DB), t)
+		tc.Conns[0], tc.Servers[0], tc.Servers[0].DB(), t)
 
 	// Replicate the row ranges on all of the first 3 nodes. Save the 4th node in
 	// a pristine state, with empty caches.
@@ -111,26 +109,25 @@ func TestSpanResolverUsesCaches(t *testing.T) {
 
 	// Resolve the spans. Since the LeaseHolderCache is empty, all the ranges
 	// should be grouped and "assigned" to replica 0.
-	replicas, err := resolveSpans(context.TODO(), lr.NewSpanResolverIterator(), spans...)
+	replicas, err := resolveSpans(context.TODO(), lr.NewSpanResolverIterator(nil), spans...)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if len(replicas) != 3 {
-		t.Fatalf("expected replies for 3 spans, got %d: %+v", len(replicas), replicas)
+		t.Fatalf("expected replies for 3 spans, got %d", len(replicas))
 	}
 	si := tc.Servers[0]
 
-	nodeID := si.GetNode().Descriptor.NodeID
 	storeID := si.GetFirstStoreID()
 	for i := 0; i < 3; i++ {
 		if len(replicas[i]) != 1 {
-			t.Fatalf("expected 1 range for span %s, got %d (%+v)",
-				spans[i].Span, len(replicas[i]), replicas[i])
+			t.Fatalf("expected 1 range for span %s, got %d",
+				spans[i].Span, len(replicas[i]))
 		}
 		rd := replicas[i][0].ReplicaDescriptor
-		if rd.NodeID != nodeID || rd.StoreID != storeID {
-			t.Fatalf("expected span %s to be on replica (%d, %d) but was on %s",
-				spans[i].Span, nodeID, storeID, rd)
+		if rd.StoreID != storeID {
+			t.Fatalf("expected span %s to be on replica (%d) but was on %s",
+				spans[i].Span, storeID, rd)
 		}
 	}
 
@@ -139,7 +136,7 @@ func TestSpanResolverUsesCaches(t *testing.T) {
 	if err := populateCache(tc.Conns[3], 3 /* expectedNumRows */); err != nil {
 		t.Fatal(err)
 	}
-	replicas, err = resolveSpans(context.TODO(), lr.NewSpanResolverIterator(), spans...)
+	replicas, err = resolveSpans(context.TODO(), lr.NewSpanResolverIterator(nil), spans...)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -182,8 +179,7 @@ func splitRangeAtVal(
 		return roachpb.RangeDescriptor{}, roachpb.RangeDescriptor{}, err
 	}
 
-	startKey := keys.MakeRowSentinelKey(pik)
-	leftRange, rightRange, err := ts.SplitRange(startKey)
+	leftRange, rightRange, err := ts.SplitRange(pik)
 	if err != nil {
 		return roachpb.RangeDescriptor{}, roachpb.RangeDescriptor{},
 			errors.Wrapf(err, "failed to split at row: %d", pk)
@@ -196,7 +192,7 @@ func TestSpanResolver(t *testing.T) {
 	s, db, cdb := serverutils.StartServer(t, base.TestServerArgs{
 		UseDatabase: "t",
 	})
-	defer s.Stopper().Stop()
+	defer s.Stopper().Stop(context.TODO())
 
 	rowRanges, tableDesc := setupRanges(db, s.(*server.TestServer), cdb, t)
 	lr := distsqlplan.NewSpanResolver(
@@ -205,7 +201,7 @@ func TestSpanResolver(t *testing.T) {
 		distsqlplan.BinPackingLeaseHolderChoice)
 
 	ctx := context.Background()
-	it := lr.NewSpanResolverIterator()
+	it := lr.NewSpanResolverIterator(nil)
 
 	testCases := []struct {
 		spans    []roachpb.Span
@@ -289,7 +285,7 @@ func TestMixedDirections(t *testing.T) {
 	s, db, cdb := serverutils.StartServer(t, base.TestServerArgs{
 		UseDatabase: "t",
 	})
-	defer s.Stopper().Stop()
+	defer s.Stopper().Stop(context.TODO())
 
 	rowRanges, tableDesc := setupRanges(db, s.(*server.TestServer), cdb, t)
 	lr := distsqlplan.NewSpanResolver(
@@ -298,7 +294,7 @@ func TestMixedDirections(t *testing.T) {
 		distsqlplan.BinPackingLeaseHolderChoice)
 
 	ctx := context.Background()
-	it := lr.NewSpanResolverIterator()
+	it := lr.NewSpanResolverIterator(nil)
 
 	spans := []spanWithDir{
 		orient(kv.Ascending, makeSpan(tableDesc, 11, 15))[0],
@@ -388,7 +384,7 @@ type rngInfo struct {
 }
 
 func resolveSpans(
-	ctx context.Context, it *distsqlplan.SpanResolverIterator, spans ...spanWithDir,
+	ctx context.Context, it distsqlplan.SpanResolverIterator, spans ...spanWithDir,
 ) ([][]rngInfo, error) {
 	res := make([][]rngInfo, 0)
 	for _, span := range spans {
@@ -433,19 +429,21 @@ func selectReplica(nodeID roachpb.NodeID, rng roachpb.RangeDescriptor) rngInfo {
 func expectResolved(actual [][]rngInfo, expected ...[]rngInfo) error {
 	if len(actual) != len(expected) {
 		return errors.Errorf(
-			"expected %d ranges, got %d: %+v", len(expected), len(actual), actual)
+			"expected %d ranges, got %d", len(expected), len(actual))
 	}
 	for i, exp := range expected {
 		act := actual[i]
 		if len(exp) != len(act) {
-			return errors.Errorf("expected %d ranges, got %d (%+v)",
-				len(exp), len(act), act)
+			return errors.Errorf("expected %d ranges, got %d",
+				len(exp), len(act))
 		}
 		for i, e := range exp {
 			a := act[i]
-			if e.ReplicaDescriptor != a.ReplicaDescriptor || e.rngDesc.RangeID != a.rngDesc.RangeID {
+			if e.ReplicaDescriptor.StoreID != a.ReplicaDescriptor.StoreID || e.rngDesc.RangeID != a.rngDesc.RangeID {
 				return errors.Errorf(
-					"expected replica: %+v but got: %+v", e, a)
+					"expected replica (%d,%d) but got: (%d,%d)",
+					e.ReplicaDescriptor.StoreID, e.rngDesc.RangeID,
+					a.ReplicaDescriptor.StoreID, a.rngDesc.RangeID)
 			}
 		}
 	}

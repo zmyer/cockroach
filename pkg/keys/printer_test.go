@@ -11,20 +11,18 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
 // implied. See the License for the specific language governing
 // permissions and limitations under the License.
-//
-// Author: Veteran Lu (23907238@qq.com)
 
 package keys
 
 import (
 	"bytes"
+	"encoding/hex"
 	"fmt"
 	"math"
 	"testing"
 	"time"
 
-	"gopkg.in/inf.v0"
-
+	"github.com/cockroachdb/apd"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/util/duration"
 	"github.com/cockroachdb/cockroach/pkg/util/encoding"
@@ -32,7 +30,6 @@ import (
 )
 
 func TestPrettyPrint(t *testing.T) {
-
 	tm, _ := time.Parse(time.RFC3339Nano, "2016-03-30T13:40:35.053725008Z")
 	duration := duration.Duration{Months: 1, Days: 1, Nanos: 1 * time.Second.Nanoseconds()}
 	durationAsc, _ := encoding.EncodeDurationAscending(nil, duration)
@@ -49,9 +46,13 @@ func TestPrettyPrint(t *testing.T) {
 		// local
 		{StoreIdentKey(), "/Local/Store/storeIdent"},
 		{StoreGossipKey(), "/Local/Store/gossipBootstrap"},
+		{StoreClusterVersionKey(), "/Local/Store/clusterVersion"},
+		{StoreSuggestedCompactionKey(MinKey, roachpb.Key("b")), `/Local/Store/suggestedCompaction/{/Min-"b"}`},
+		{StoreSuggestedCompactionKey(roachpb.Key("a"), roachpb.Key("b")), `/Local/Store/suggestedCompaction/{"a"-"b"}`},
+		{StoreSuggestedCompactionKey(roachpb.Key("a"), MaxKey), `/Local/Store/suggestedCompaction/{"a"-/Max}`},
 
-		{AbortCacheKey(roachpb.RangeID(1000001), txnID), fmt.Sprintf(`/Local/RangeID/1000001/r/AbortCache/%q`, txnID)},
-		{RaftTombstoneKey(roachpb.RangeID(1000001)), "/Local/RangeID/1000001/r/RaftTombstone"},
+		{AbortSpanKey(roachpb.RangeID(1000001), txnID), fmt.Sprintf(`/Local/RangeID/1000001/r/AbortSpan/%q`, txnID)},
+		{RaftTombstoneIncorrectLegacyKey(roachpb.RangeID(1000001)), "/Local/RangeID/1000001/r/RaftTombstone"},
 		{RaftAppliedIndexKey(roachpb.RangeID(1000001)), "/Local/RangeID/1000001/r/RaftAppliedIndex"},
 		{LeaseAppliedIndexKey(roachpb.RangeID(1000001)), "/Local/RangeID/1000001/r/LeaseAppliedIndex"},
 		{RaftTruncatedStateKey(roachpb.RangeID(1000001)), "/Local/RangeID/1000001/r/RaftTruncatedState"},
@@ -63,21 +64,22 @@ func TestPrettyPrint(t *testing.T) {
 
 		{RaftHardStateKey(roachpb.RangeID(1000001)), "/Local/RangeID/1000001/u/RaftHardState"},
 		{RaftLastIndexKey(roachpb.RangeID(1000001)), "/Local/RangeID/1000001/u/RaftLastIndex"},
+		{RaftTombstoneKey(roachpb.RangeID(1000001)), "/Local/RangeID/1000001/u/RaftTombstone"},
 		{RaftLogKey(roachpb.RangeID(1000001), uint64(200001)), "/Local/RangeID/1000001/u/RaftLog/logIndex:200001"},
 		{RangeLastReplicaGCTimestampKey(roachpb.RangeID(1000001)), "/Local/RangeID/1000001/u/RangeLastReplicaGCTimestamp"},
 		{RangeLastVerificationTimestampKeyDeprecated(roachpb.RangeID(1000001)), "/Local/RangeID/1000001/u/RangeLastVerificationTimestamp"},
 
-		{MakeRangeKeyPrefix(roachpb.RKey("ok")), `/Local/Range/"ok"`},
-		{RangeDescriptorKey(roachpb.RKey("111")), `/Local/Range/"111"/RangeDescriptor`},
-		{TransactionKey(roachpb.Key("111"), txnID), fmt.Sprintf(`/Local/Range/"111"/Transaction/addrKey:/id:%q`, txnID)},
-		{QueueLastProcessedKey(roachpb.RKey("111"), "foo"), `/Local/Range/"111"/QueueLastProcessed/addrKey:/id:"foo"`},
+		{MakeRangeKeyPrefix(roachpb.RKey(MakeTablePrefix(42))), `/Local/Range/Table/42`},
+		{RangeDescriptorKey(roachpb.RKey(MakeTablePrefix(42))), `/Local/Range/Table/42/RangeDescriptor`},
+		{TransactionKey(roachpb.Key(MakeTablePrefix(42)), txnID), fmt.Sprintf(`/Local/Range/Table/42/Transaction/%q`, txnID)},
+		{QueueLastProcessedKey(roachpb.RKey(MakeTablePrefix(42)), "foo"), `/Local/Range/Table/42/QueueLastProcessed/"foo"`},
 
 		{LocalMax, `/Meta1/""`}, // LocalMax == Meta1Prefix
 
 		// system
 		{makeKey(Meta2Prefix, roachpb.Key("foo")), `/Meta2/"foo"`},
 		{makeKey(Meta1Prefix, roachpb.Key("foo")), `/Meta1/"foo"`},
-		{RangeMetaKey(roachpb.RKey("f")), `/Meta2/"f"`},
+		{RangeMetaKey(roachpb.RKey("f")).AsRawKey(), `/Meta2/"f"`},
 
 		{NodeLivenessKey(10033), "/System/NodeLiveness/10033"},
 		{NodeStatusKey(1111), "/System/StatusNode/1111"},
@@ -85,11 +87,12 @@ func TestPrettyPrint(t *testing.T) {
 		{SystemMax, "/System/Max"},
 
 		// key of key
-		{RangeMetaKey(roachpb.RKey(MakeRangeKeyPrefix(roachpb.RKey("ok")))), `/Meta2/Local/Range/"ok"`},
-		{RangeMetaKey(roachpb.RKey(makeKey(MakeTablePrefix(42), roachpb.RKey("foo")))), `/Meta2/Table/42/"foo"`},
-		{RangeMetaKey(roachpb.RKey(makeKey(Meta2Prefix, roachpb.Key("foo")))), `/Meta1/"foo"`},
+		{RangeMetaKey(roachpb.RKey(MakeRangeKeyPrefix(MakeTablePrefix(42)))).AsRawKey(), `/Meta2/Local/Range/Table/42`},
+		{RangeMetaKey(roachpb.RKey(makeKey(MakeTablePrefix(42), roachpb.RKey("foo")))).AsRawKey(), `/Meta2/Table/42/"foo"`},
+		{RangeMetaKey(roachpb.RKey(makeKey(Meta2Prefix, roachpb.Key("foo")))).AsRawKey(), `/Meta1/"foo"`},
 
 		// table
+		{SystemConfigSpan.Key, "/Table/SystemConfigSpan/Start"},
 		{UserTableDataMin, "/Table/50"},
 		{MakeTablePrefix(111), "/Table/111"},
 		{makeKey(MakeTablePrefix(42), roachpb.RKey("foo")), `/Table/42/"foo"`},
@@ -127,7 +130,11 @@ func TestPrettyPrint(t *testing.T) {
 		{makeKey(MakeTablePrefix(42),
 			roachpb.RKey(encoding.EncodeNullAscending(nil))), "/Table/42/NULL"},
 		{makeKey(MakeTablePrefix(42),
-			roachpb.RKey(encoding.EncodeNotNullAscending(nil))), "/Table/42/#"},
+			roachpb.RKey(encoding.EncodeNullDescending(nil))), "/Table/42/NULL"},
+		{makeKey(MakeTablePrefix(42),
+			roachpb.RKey(encoding.EncodeNotNullAscending(nil))), "/Table/42/!NULL"},
+		{makeKey(MakeTablePrefix(42),
+			roachpb.RKey(encoding.EncodeNotNullDescending(nil))), "/Table/42/#"},
 		{makeKey(MakeTablePrefix(42),
 			roachpb.RKey(encoding.EncodeTimeAscending(nil, tm))),
 			"/Table/42/2016-03-30T13:40:35.053725008Z"},
@@ -135,26 +142,32 @@ func TestPrettyPrint(t *testing.T) {
 			roachpb.RKey(encoding.EncodeTimeDescending(nil, tm))),
 			"/Table/42/1923-10-04T10:19:23.946274991Z"},
 		{makeKey(MakeTablePrefix(42),
-			roachpb.RKey(encoding.EncodeDecimalAscending(nil, inf.NewDec(1234, 2)))),
+			roachpb.RKey(encoding.EncodeDecimalAscending(nil, apd.New(1234, -2)))),
 			"/Table/42/12.34"},
 		{makeKey(MakeTablePrefix(42),
-			roachpb.RKey(encoding.EncodeDecimalDescending(nil, inf.NewDec(1234, 2)))),
+			roachpb.RKey(encoding.EncodeDecimalDescending(nil, apd.New(1234, -2)))),
 			"/Table/42/-12.34"},
 		{makeKey(MakeTablePrefix(42),
 			roachpb.RKey(durationAsc)),
-			"/Table/42/1m1d1s"},
+			"/Table/42/1mon1d1s"},
 		{makeKey(MakeTablePrefix(42),
 			roachpb.RKey(durationDesc)),
-			"/Table/42/-2m-2d743h59m58.999999999s"},
+			"/Table/42/-2mon-2d743h59m58s999ms999µs999ns"},
+
+		// sequence
+		{MakeSequenceKey(55), `/Table/55/1/0/0`},
 
 		// others
 		{makeKey([]byte("")), "/Min"},
 		{Meta1KeyMax, "/Meta1/Max"},
 		{Meta2KeyMax, "/Meta2/Max"},
-		{makeKey(MakeTablePrefix(42), roachpb.RKey([]byte{0x12, 'a', 0x00, 0x02})), "/Table/42/<unknown escape sequence: 0x0 0x2>"},
+		{makeKey(MakeTablePrefix(42), roachpb.RKey([]byte{0xf6})), `/Table/42/109/PrefixEnd`},
+		{makeKey(MakeTablePrefix(42), roachpb.RKey([]byte{0xf7})), `/Table/42/255/PrefixEnd`},
+		{makeKey(MakeTablePrefix(42), roachpb.RKey([]byte{0x12, 'a', 0x00, 0x02})), `/Table/42/"a"/PrefixEnd`},
+		{makeKey(MakeTablePrefix(42), roachpb.RKey([]byte{0x12, 'a', 0x00, 0x03})), `/Table/42/???`},
 	}
 	for i, test := range testCases {
-		keyInfo := MassagePrettyPrintedSpanForTest(PrettyPrint(test.key), nil)
+		keyInfo := MassagePrettyPrintedSpanForTest(PrettyPrint(nil /* valDirs */, test.key), nil)
 		exp := MassagePrettyPrintedSpanForTest(test.exp, nil)
 		if exp != keyInfo {
 			t.Errorf("%d: expected %s, got %s", i, exp, keyInfo)
@@ -181,6 +194,8 @@ func TestPrettyPrint(t *testing.T) {
 }
 
 func TestPrettyPrintRange(t *testing.T) {
+	key := makeKey([]byte("a"))
+	key2 := makeKey([]byte("z"))
 	tableKey := makeKey(MakeTablePrefix(61), encoding.EncodeVarintAscending(nil, 4))
 	tableKey2 := makeKey(MakeTablePrefix(61), encoding.EncodeVarintAscending(nil, 500))
 
@@ -189,6 +204,9 @@ func TestPrettyPrintRange(t *testing.T) {
 		maxChars   int
 		expected   string
 	}{
+		{key, nil, 20, "a"},
+		{tableKey, nil, 10, "/Table/61…"},
+		{key, key2, 20, "{a-z}"},
 		{MinKey, tableKey, 8, "/{M…-T…}"},
 		{MinKey, tableKey, 15, "/{Min-Tabl…}"},
 		{MinKey, tableKey, 20, "/{Min-Table/6…}"},
@@ -202,10 +220,22 @@ func TestPrettyPrintRange(t *testing.T) {
 	}
 
 	for i, tc := range testCases {
-		var buf bytes.Buffer
-		PrettyPrintRange(&buf, tc.start, tc.end, tc.maxChars)
-		if str := buf.String(); str != tc.expected {
+		str := PrettyPrintRange(tc.start, tc.end, tc.maxChars)
+		if str != tc.expected {
 			t.Errorf("%d: expected \"%s\", got \"%s\"", i, tc.expected, str)
 		}
+	}
+}
+
+func TestFormatHexKey(t *testing.T) {
+	// Verify that we properly handling the 'x' formatting verb in
+	// roachpb.Key.Format.
+	key := StoreIdentKey()
+	decoded, err := hex.DecodeString(fmt.Sprintf("%x", key))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(key, decoded) {
+		t.Fatalf("expected %s, but found %s", key, decoded)
 	}
 }

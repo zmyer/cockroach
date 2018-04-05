@@ -11,13 +11,12 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
 // implied. See the License for the specific language governing
 // permissions and limitations under the License.
-//
-// Author: Tobias Schottdorf
 
 package roachpb
 
 import (
 	"bytes"
+	"context"
 	"fmt"
 	"strings"
 
@@ -28,23 +27,32 @@ import (
 
 //go:generate go run -tags gen-batch gen_batch.go
 
-// SetActiveTimestamp sets the correct timestamp at which the request is to be
-// carried out. For transactional requests, ba.Timestamp must be zero initially
-// and it will be set to txn.OrigTimestamp. For non-transactional requests, if
-// no timestamp is specified, nowFn is used to create and set one.
+// SetActiveTimestamp sets the correct timestamp at which the request
+// is to be carried out. For transactional requests, ba.Timestamp must
+// be zero initially and it will be set to txn.OrigTimestamp (and
+// forwarded to txn.SafeTimestamp if non-zero). For non-transactional
+// requests, if no timestamp is specified, nowFn is used to create and
+// set one.
 func (ba *BatchRequest) SetActiveTimestamp(nowFn func() hlc.Timestamp) error {
-	if ba.Txn == nil {
-		// When not transactional, allow empty timestamp and  use nowFn instead.
-		if ba.Timestamp.Equal(hlc.ZeroTimestamp) {
-			ba.Timestamp.Forward(nowFn())
+	if txn := ba.Txn; txn != nil {
+		if ba.Timestamp != (hlc.Timestamp{}) {
+			return errors.New("transactional request must not set batch timestamp")
 		}
-	} else if !ba.Timestamp.Equal(hlc.ZeroTimestamp) {
-		return errors.New("transactional request must not set batch timestamp")
-	} else {
+
 		// Always use the original timestamp for reads and writes, even
 		// though some intents may be written at higher timestamps in the
 		// event of a WriteTooOldError.
-		ba.Timestamp = ba.Txn.OrigTimestamp
+		ba.Timestamp = txn.OrigTimestamp
+		// If a refreshed timestamp is set for the transaction, forward
+		// the batch timestamp to it. The refreshed timestamp indicates a
+		// future timestamp at which the transaction would like to commit
+		// to safely avoid a serializable transaction restart.
+		ba.Timestamp.Forward(txn.RefreshedTimestamp)
+	} else {
+		// When not transactional, allow empty timestamp and use nowFn instead
+		if ba.Timestamp == (hlc.Timestamp{}) {
+			ba.Timestamp = nowFn()
+		}
 	}
 	return nil
 }
@@ -56,6 +64,7 @@ func (ba *BatchRequest) UpdateTxn(otherTxn *Transaction) {
 	if otherTxn == nil {
 		return
 	}
+	otherTxn.AssertInitialized(context.TODO())
 	if ba.Txn == nil {
 		ba.Txn = otherTxn
 		return
@@ -63,26 +72,6 @@ func (ba *BatchRequest) UpdateTxn(otherTxn *Transaction) {
 	clonedTxn := ba.Txn.Clone()
 	clonedTxn.Update(otherTxn)
 	ba.Txn = &clonedTxn
-}
-
-// IsConsistencyRelated returns whether the batch consists of a single
-// ComputeChecksum or CheckConsistency request.
-func (ba *BatchRequest) IsConsistencyRelated() bool {
-	if !ba.IsSingleRequest() {
-		return false
-	}
-	_, ok1 := ba.GetArg(ComputeChecksum)
-	_, ok2 := ba.GetArg(CheckConsistency)
-	return ok1 || ok2
-}
-
-// IsFreeze returns whether the batch consists of a single ChangeFrozen request.
-func (ba *BatchRequest) IsFreeze() bool {
-	if !ba.IsSingleRequest() {
-		return false
-	}
-	_, ok := ba.GetArg(ChangeFrozen)
-	return ok
 }
 
 // IsLeaseRequest returns whether the batch consists of a single RequestLease
@@ -133,27 +122,46 @@ func (ba *BatchRequest) IsSingleRequest() bool {
 	return len(ba.Requests) == 1
 }
 
-// IsNonKV returns true iff all of the requests in the batch have the non-KV
-// flag set.
-func (ba *BatchRequest) IsNonKV() bool {
-	for _, union := range ba.Requests {
-		if (union.GetInner().flags() & isNonKV) == 0 {
-			return false
-		}
-	}
-	return true
-}
-
 // IsSingleSkipLeaseCheckRequest returns true iff the batch contains a single
 // request, and that request has the skipLeaseCheck flag set.
 func (ba *BatchRequest) IsSingleSkipLeaseCheckRequest() bool {
 	return ba.IsSingleRequest() && ba.hasFlag(skipLeaseCheck)
 }
 
+// IsSinglePushTxnRequest returns true iff the batch contains a single
+// request, and that request is for a PushTxn.
+func (ba *BatchRequest) IsSinglePushTxnRequest() bool {
+	if ba.IsSingleRequest() {
+		_, ok := ba.Requests[0].GetInner().(*PushTxnRequest)
+		return ok
+	}
+	return false
+}
+
+// IsSingleQueryTxnRequest returns true iff the batch contains a single
+// request, and that request is for a QueryTxn.
+func (ba *BatchRequest) IsSingleQueryTxnRequest() bool {
+	if ba.IsSingleRequest() {
+		_, ok := ba.Requests[0].GetInner().(*QueryTxnRequest)
+		return ok
+	}
+	return false
+}
+
+// IsSingleEndTransactionRequest returns true iff the batch contains a single
+// request, and that request is an EndTransactionRequest.
+func (ba *BatchRequest) IsSingleEndTransactionRequest() bool {
+	if ba.IsSingleRequest() {
+		_, ok := ba.Requests[0].GetInner().(*EndTransactionRequest)
+		return ok
+	}
+	return false
+}
+
 // GetPrevLeaseForLeaseRequest returns the previous lease, at the time
 // of proposal, for a request lease or transfer lease request. If the
 // batch does not contain a single lease request, this method will panic.
-func (ba *BatchRequest) GetPrevLeaseForLeaseRequest() *Lease {
+func (ba *BatchRequest) GetPrevLeaseForLeaseRequest() Lease {
 	return ba.Requests[0].GetInner().(leaseRequestor).prevLease()
 }
 
@@ -204,44 +212,86 @@ func (br *BatchResponse) String() string {
 // contained in the requests are used, but when a response contains a
 // ResumeSpan the ResumeSpan is subtracted from the request span to provide a
 // more minimal span of keys affected by the request.
-func (ba *BatchRequest) IntentSpanIterate(br *BatchResponse, fn func(key, endKey Key)) {
+func (ba *BatchRequest) IntentSpanIterate(br *BatchResponse, fn func(Span)) {
 	for i, arg := range ba.Requests {
 		req := arg.GetInner()
 		if !IsTransactionWrite(req) {
 			continue
 		}
-		h := req.Header()
+		var resp Response
 		if br != nil {
-			resumeSpan := br.Responses[i].GetInner().Header().ResumeSpan
-			// If a resume span exists we need to cull the span.
-			if resumeSpan != nil {
-				if bytes.Equal(resumeSpan.Key, h.Key) {
-					if bytes.Equal(resumeSpan.EndKey, h.EndKey) {
-						// Nothing was written.
-						continue
-					}
-					fn(resumeSpan.EndKey, h.EndKey)
-				} else {
-					fn(h.Key, resumeSpan.Key)
-				}
-				continue
-			}
+			resp = br.Responses[i].GetInner()
 		}
-		fn(h.Key, h.EndKey)
+		if span, ok := actualSpan(req, resp); ok {
+			fn(span)
+		}
 	}
+}
+
+// RefreshSpanIterate calls the passed function with the key spans of
+// requests in the batch which need to be refreshed. These requests
+// must be checked via Refresh/RefreshRange to avoid having to restart
+// a SERIALIZABLE transaction. Usually the key spans contained in the
+// requests are used, but when a response contains a ResumeSpan the
+// ResumeSpan is subtracted from the request span to provide a more
+// minimal span of keys affected by the request. The supplied function
+// is called with each span and a bool indicating whether the span
+// updates the write timestamp cache.
+func (ba *BatchRequest) RefreshSpanIterate(br *BatchResponse, fn func(Span, bool)) {
+	for i, arg := range ba.Requests {
+		req := arg.GetInner()
+		if !NeedsRefresh(req) {
+			continue
+		}
+		var resp Response
+		if br != nil {
+			resp = br.Responses[i].GetInner()
+		}
+		if span, ok := actualSpan(req, resp); ok {
+			fn(span, UpdatesWriteTimestampCache(req))
+		}
+	}
+}
+
+// actualSpan returns the actual request span which was operated on,
+// according to the existence of a resume span in the response. If
+// nothing was operated on, returns false.
+func actualSpan(req Request, resp Response) (Span, bool) {
+	h := req.Header()
+	if resp != nil {
+		resumeSpan := resp.Header().ResumeSpan
+		// If a resume span exists we need to cull the span.
+		if resumeSpan != nil {
+			// Handle the reverse case first.
+			if bytes.Equal(resumeSpan.Key, h.Key) {
+				if bytes.Equal(resumeSpan.EndKey, h.EndKey) {
+					return Span{}, false
+				}
+				return Span{Key: resumeSpan.EndKey, EndKey: h.EndKey}, true
+			}
+			// The forward case.
+			return Span{Key: h.Key, EndKey: resumeSpan.Key}, true
+		}
+	}
+	return h, true
 }
 
 // Combine implements the Combinable interface. It combines each slot of the
 // given request into the corresponding slot of the base response. The number
 // of slots must be equal and the respective slots must be combinable.
-// On error, the receiver BatchResponse is in an invalid state.
-// TODO(tschottdorf): write tests.
-func (br *BatchResponse) Combine(otherBatch *BatchResponse) error {
-	if len(otherBatch.Responses) != len(br.Responses) {
-		return errors.New("unable to combine batch responses of different length")
+// On error, the receiver BatchResponse is in an invalid state. In either case,
+// the supplied BatchResponse must not be used any more.
+func (br *BatchResponse) Combine(otherBatch *BatchResponse, positions []int) error {
+	if err := br.BatchResponse_Header.combine(otherBatch.BatchResponse_Header); err != nil {
+		return err
 	}
-	for i, l := 0, len(br.Responses); i < l; i++ {
-		valLeft := br.Responses[i].GetInner()
+	for i := range otherBatch.Responses {
+		pos := positions[i]
+		if br.Responses[pos] == (ResponseUnion{}) {
+			br.Responses[pos] = otherBatch.Responses[i]
+			continue
+		}
+		valLeft := br.Responses[pos].GetInner()
 		valRight := otherBatch.Responses[i].GetInner()
 		cValLeft, lOK := valLeft.(combinable)
 		cValRight, rOK := valRight.(combinable)
@@ -250,16 +300,11 @@ func (br *BatchResponse) Combine(otherBatch *BatchResponse) error {
 				return err
 			}
 			continue
-		}
-		// If our slot is a NoopResponse, then whatever the other batch has is
-		// the result. Note that the result can still be a NoopResponse, to be
-		// filled in by a future Combine().
-		if _, ok := valLeft.(*NoopResponse); ok {
-			br.Responses[i] = otherBatch.Responses[i]
+		} else if lOK != rOK {
+			return errors.Errorf("can not combine %T and %T", valLeft, valRight)
 		}
 	}
 	br.Txn.Update(otherBatch.Txn)
-	br.CollectedSpans = append(br.CollectedSpans, otherBatch.CollectedSpans...)
 	return nil
 }
 

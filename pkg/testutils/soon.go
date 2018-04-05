@@ -15,11 +15,11 @@
 package testutils
 
 import (
+	"runtime/debug"
 	"testing"
 	"time"
 
-	"github.com/cockroachdb/cockroach/pkg/util"
-	"github.com/cockroachdb/cockroach/pkg/util/caller"
+	"github.com/cockroachdb/cockroach/pkg/util/retry"
 )
 
 // DefaultSucceedsSoonDuration is the maximum amount of time unittests
@@ -32,14 +32,9 @@ const DefaultSucceedsSoonDuration = 45 * time.Second
 // an exponential backoff starting at 1ns and ending at the maximum
 // duration (currently 15s).
 func SucceedsSoon(t testing.TB, fn func() error) {
-	SucceedsSoonDepth(1, t, fn)
-}
-
-// SucceedsSoonDepth is like SucceedsSoon() but with an additional
-// stack depth offset.
-func SucceedsSoonDepth(depth int, t testing.TB, fn func() error) {
-	if err := util.RetryForDuration(DefaultSucceedsSoonDuration, fn); err != nil {
-		file, line, _ := caller.Lookup(depth + 1)
-		t.Fatalf("%s:%d, condition failed to evaluate within %s: %s", file, line, DefaultSucceedsSoonDuration, err)
+	t.Helper()
+	if err := retry.ForDuration(DefaultSucceedsSoonDuration, fn); err != nil {
+		t.Fatalf("condition failed to evaluate within %s: %s\n%s",
+			DefaultSucceedsSoonDuration, err, string(debug.Stack()))
 	}
 }

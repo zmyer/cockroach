@@ -11,20 +11,22 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
 // implied. See the License for the specific language governing
 // permissions and limitations under the License.
-//
-// Author: Matt Tracy (matt@cockroachlabs.com)
 
 package server_test
 
 import (
+	"context"
 	"testing"
 	"time"
 
 	"github.com/pkg/errors"
 
 	"github.com/cockroachdb/cockroach/pkg/base"
+	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/server/serverpb"
+	"github.com/cockroachdb/cockroach/pkg/storage"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
+	"github.com/cockroachdb/cockroach/pkg/testutils/serverutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/testcluster"
 	"github.com/cockroachdb/cockroach/pkg/util/httputil"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
@@ -32,7 +34,6 @@ import (
 
 func TestAdminAPITableStats(t *testing.T) {
 	defer leaktest.AfterTest(t)()
-	t.Skip("#8890")
 
 	const nodeCount = 3
 	tc := testcluster.StartTestCluster(t, nodeCount, base.TestClusterArgs{
@@ -42,18 +43,18 @@ func TestAdminAPITableStats(t *testing.T) {
 			ScanMaxIdleTime: time.Millisecond,
 		},
 	})
-	defer tc.Stopper().Stop()
+	defer tc.Stopper().Stop(context.TODO())
 	server0 := tc.Server(0)
 
 	// Create clients (SQL, HTTP) connected to server 0.
 	db := tc.ServerConn(0)
 
-	client, err := server0.GetHTTPClient()
+	client, err := server0.GetAuthenticatedHTTPClient()
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	client.Timeout = base.NetworkTimeout * 3
+	client.Timeout = time.Hour // basically no timeout
 
 	// Make a single table and insert some data. The database and test have
 	// names which require escaping, in order to verify that database and
@@ -87,6 +88,9 @@ func TestAdminAPITableStats(t *testing.T) {
 	testutils.SucceedsSoon(t, func() error {
 		if err := httputil.GetJSON(client, url, &tsResponse); err != nil {
 			return err
+		}
+		if len(tsResponse.MissingNodes) != 0 {
+			return errors.Errorf("missing nodes: %+v", tsResponse.MissingNodes)
 		}
 		if tsResponse.RangeCount != 1 {
 			return errors.Errorf("Table range not yet separated.")
@@ -139,4 +143,53 @@ func TestAdminAPITableStats(t *testing.T) {
 	// detecting leaks.
 	client.Timeout = 1 * time.Nanosecond
 	_ = httputil.GetJSON(client, url, &tsResponse)
+}
+
+func TestLivenessAPI(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	tc := testcluster.StartTestCluster(t, 3, base.TestClusterArgs{})
+	defer tc.Stopper().Stop(context.TODO())
+
+	startTime := tc.Server(0).Clock().PhysicalNow()
+
+	// We need to retry because the gossiping of liveness status is an
+	// asynchronous process.
+	testutils.SucceedsSoon(t, func() error {
+		var resp serverpb.LivenessResponse
+		if err := serverutils.GetJSONProto(tc.Server(0), "/_admin/v1/liveness", &resp); err != nil {
+			return err
+		}
+		if a, e := len(resp.Livenesses), tc.NumServers(); a != e {
+			return errors.Errorf("found %d liveness records, wanted %d", a, e)
+		}
+		livenessMap := make(map[roachpb.NodeID]storage.Liveness)
+		for _, l := range resp.Livenesses {
+			livenessMap[l.NodeID] = l
+		}
+		for i := 0; i < tc.NumServers(); i++ {
+			s := tc.Server(i)
+			sl, ok := livenessMap[s.NodeID()]
+			if !ok {
+				return errors.Errorf("found no liveness record for node %d", s.NodeID())
+			}
+			if sl.Expiration.WallTime < startTime {
+				return errors.Errorf(
+					"expected node %d liveness to expire in future (after %d), expiration was %d",
+					s.NodeID(),
+					startTime,
+					sl.Expiration,
+				)
+			}
+			status, ok := resp.Statuses[s.NodeID()]
+			if !ok {
+				return errors.Errorf("found no liveness status for node %d", s.NodeID())
+			}
+			if a, e := status, storage.NodeLivenessStatus_LIVE; a != e {
+				return errors.Errorf(
+					"liveness status for node %s was %s, wanted %s", s.NodeID(), a, e,
+				)
+			}
+		}
+		return nil
+	})
 }

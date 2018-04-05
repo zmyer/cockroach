@@ -11,23 +11,33 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
 // implied. See the License for the specific language governing
 // permissions and limitations under the License.
-//
-// Author: Matt Tracy (matt@cockroachlabs.com)
 
 package ts
 
 import (
 	"container/heap"
+	"context"
 	"fmt"
+	"math"
 	"sort"
 	"time"
-
-	"golang.org/x/net/context"
+	"unsafe"
 
 	"github.com/cockroachdb/cockroach/pkg/internal/client"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/ts/tspb"
+	"github.com/cockroachdb/cockroach/pkg/util/mon"
+	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/pkg/errors"
+)
+
+// Compute the size of various structures to use when tracking memory usage.
+var (
+	sizeOfDataSpan       = int64(unsafe.Sizeof(dataSpan{}))
+	sizeOfCalibratedData = int64(unsafe.Sizeof(calibratedData{}))
+	sizeOfTimeSeriesData = int64(unsafe.Sizeof(roachpb.InternalTimeSeriesData{}))
+	sizeOfSample         = int64(unsafe.Sizeof(roachpb.InternalTimeSeriesSample{}))
+	sizeOfDataPoint      = int64(unsafe.Sizeof(tspb.TimeSeriesDatapoint{}))
 )
 
 // calibratedData is used to calibrate an InternalTimeSeriesData object for
@@ -72,12 +82,6 @@ func (ds *dataSpan) addData(data roachpb.InternalTimeSeriesData) error {
 	rd := calibratedData{
 		InternalTimeSeriesData: data,
 		offsetAdjustment:       int32(adjustment),
-	}
-
-	// If all samples in the supplied data set are before calibrated offset 0,
-	// do not include it.
-	if rd.offsetAt(len(data.Samples)-1) < 0 {
-		return nil
 	}
 
 	// If the supplied data does not occur after all previously added data,
@@ -400,13 +404,18 @@ func (dsi *downsamplingIterator) computeEnd() {
 // Values for missing offsets are computed using linear interpolation from the
 // nearest real samples preceding and following the missing offset.
 //
+// If the maxDistance option is set to a value greater than zero, values will
+// not be interpolated between real data points which have a difference in
+// offset greater than maxDistance.
+//
 // If the derivative option is set, value() will return the derivative of the
 // series at the current offset in units per offset.
 type interpolatingIterator struct {
-	offset     int32                // Current offset within dataSpan
-	nextReal   downsamplingIterator // Next sample with an offset >= iterator's offset
-	prevReal   downsamplingIterator // Prev sample with offset < iterator's offset
-	derivative tspb.TimeSeriesQueryDerivative
+	offset      int32                // Current offset within dataSpan
+	maxDistance int32                // Maximum distance between real values for interpolation.
+	nextReal    downsamplingIterator // Next sample with an offset >= iterator's offset
+	prevReal    downsamplingIterator // Prev sample with offset < iterator's offset
+	derivative  tspb.TimeSeriesQueryDerivative
 }
 
 // newInterpolatingIterator returns an interpolating iterator for the given
@@ -417,6 +426,7 @@ func newInterpolatingIterator(
 	ds dataSpan,
 	startOffset int32,
 	sampleNanos int64,
+	maxDistance int32,
 	extractFn extractFn,
 	downsampleFn downsampleFn,
 	derivative tspb.TimeSeriesQueryDerivative,
@@ -427,9 +437,10 @@ func newInterpolatingIterator(
 
 	nextReal := newDownsamplingIterator(ds, startOffset, sampleNanos, extractFn, downsampleFn)
 	iterator := interpolatingIterator{
-		offset:     startOffset,
-		nextReal:   nextReal,
-		derivative: derivative,
+		offset:      startOffset,
+		maxDistance: maxDistance,
+		nextReal:    nextReal,
+		derivative:  derivative,
 	}
 
 	prevReal := nextReal
@@ -470,18 +481,25 @@ func (ii *interpolatingIterator) midTimestamp() int64 {
 }
 
 // value returns the value at the current offset of this iterator, or the
-// derivative at the current offset.
-func (ii *interpolatingIterator) value() float64 {
+// derivative at the current offset. The boolean parameter indicates if the
+// returned value represents a valid value; if false, the iterator is unable
+// to return a value at the current offset.
+func (ii *interpolatingIterator) value() (float64, bool) {
 	if !ii.isValid() {
-		return 0
+		return 0, false
 	}
 	isDerivative := ii.derivative != tspb.TimeSeriesQueryDerivative_NONE
 	if !isDerivative && ii.nextReal.offset() == ii.offset {
-		return ii.nextReal.value()
+		return ii.nextReal.value(), true
 	}
 	// Cannot interpolate or compute derivative if previous value is invalid.
 	if !ii.prevReal.isValid() {
-		return 0
+		return 0, false
+	}
+
+	// Do not interpolate if hole is greater than maxDistance.
+	if ii.maxDistance > 0 && (ii.nextReal.offset()-ii.prevReal.offset()) > ii.maxDistance {
+		return 0, false
 	}
 
 	// Linear interpolation of derivative or value at the current offset.
@@ -496,14 +514,14 @@ func (ii *interpolatingIterator) value() float64 {
 	// incidence of floating point artifacts in the non-derivative case due to
 	// the order of operations.
 	if !isDerivative {
-		return prevVal + (nextVal-prevVal)*(off-prevOff)/(nextOff-prevOff)
+		return prevVal + (nextVal-prevVal)*(off-prevOff)/(nextOff-prevOff), true
 	}
 	deriv := (nextVal - prevVal) / (nextOff - prevOff)
 	if ii.derivative == tspb.TimeSeriesQueryDerivative_NON_NEGATIVE_DERIVATIVE &&
 		deriv < 0 {
-		return 0
+		return 0, true
 	}
-	return deriv
+	return deriv, true
 }
 
 // An aggregatingIterator jointly advances multiple interpolatingIterators,
@@ -577,6 +595,16 @@ func (ai aggregatingIterator) isValid() bool {
 	return len(ai) > 0 && ai[0].isValid()
 }
 
+// anyInvalid returns true if any component interpolatingIterator is invalid.
+func (ai aggregatingIterator) anyInvalid() bool {
+	for i := range ai {
+		if !ai[i].isValid() {
+			return true
+		}
+	}
+	return false
+}
+
 // init initializes the aggregatingIterator. This method moves all component
 // iterators to the first offset for which *any* interpolatingIterator in the
 // set has *real* data.
@@ -630,46 +658,233 @@ func (ai aggregatingIterator) timestamp() int64 {
 	return ai[0].midTimestamp()
 }
 
-// sum returns the sum of the current values of the interpolatingIterators being
-// aggregated.
-func (ai aggregatingIterator) sum() float64 {
+// validSumAndCount returns the sum value and count of all component
+// interpolatingIterators that currently have valid values.
+func (ai aggregatingIterator) validSumAndCount() (float64, int) {
 	var sum float64
+	var count int
 	for i := range ai {
-		sum = sum + ai[i].value()
+		value, valid := ai[i].value()
+		if valid {
+			sum += value
+			count++
+		}
 	}
-	return sum
+	return sum, count
+}
+
+// sum returns the sum of the current values of the interpolatingIterators being
+// aggregated. The boolean parameter indicates if the returned value is valid;
+// it will be invalid if all component iterators are invalid.
+func (ai aggregatingIterator) sum() (float64, bool) {
+	sum, count := ai.validSumAndCount()
+	if count == 0 {
+		return 0.0, false
+	}
+	return sum, true
 }
 
 // avg returns the average of the current values of the interpolatingIterators
-// being aggregated.
-func (ai aggregatingIterator) avg() float64 {
-	return ai.sum() / float64(len(ai))
+// being aggregated. The boolean parameter indicates if the returned value is
+// valid; it will be invalid if all component iterators are invalid.
+func (ai aggregatingIterator) avg() (float64, bool) {
+	sum, count := ai.validSumAndCount()
+	if count == 0 {
+		return 0.0, false
+	}
+	return sum / float64(count), true
 }
 
 // max return the maximum value of the current values of the
-// interpolatingIterators being aggregated.
-func (ai aggregatingIterator) max() float64 {
-	max := ai[0].value()
-	for i := range ai[1:] {
-		val := ai[i+1].value()
-		if val > max {
-			max = val
+// interpolatingIterators being aggregated. The boolean parameter indicates if
+// the returned value is valid; it will be invalid if all component iterators
+// are invalid.
+func (ai aggregatingIterator) max() (float64, bool) {
+	max := math.Inf(-1)
+	anyValid := false
+	for i := range ai {
+		value, valid := ai[i].value()
+		anyValid = anyValid || valid
+		if valid && value > max {
+			max = value
 		}
 	}
-	return max
+	return max, anyValid
 }
 
 // min return the minimum value of the current values of the
-// interpolatingIterators being aggregated.
-func (ai aggregatingIterator) min() float64 {
-	min := ai[0].value()
-	for i := range ai[1:] {
-		val := ai[i+1].value()
-		if val < min {
-			min = val
+// interpolatingIterators being aggregated. The boolean parameter indicates if
+// the returned value is valid; it will be invalid if all component iterators
+// are invalid.
+func (ai aggregatingIterator) min() (float64, bool) {
+	min := math.Inf(1)
+	anyValid := false
+	for i := range ai {
+		value, valid := ai[i].value()
+		anyValid = anyValid || valid
+		if valid && value < min {
+			min = value
 		}
 	}
-	return min
+	return min, anyValid
+}
+
+// makeLeadingEdgeFilter returns a function that filters data points near the
+// leading edge of time that are "incomplete". Any data point with a timestamp
+// later than the supplied "leading edge" timestamp (leadingEdgeNanos) is
+// required to have a valid contribution from all sources being aggregated.
+//
+// A detailed explanation of why this is necessary: New time series data points
+// are, in typical usage, always added at the current time; however, due to the
+// curiosities of clock skew, it is a common occurrence for the most recent data
+// point to be available for some sources, but not from others. For queries
+// which aggregate from multple sources, this can lead to a situation where a
+// persistent and precipitous dip at very end of data graphs. This happens
+// because the most recent point only represents the aggregation of a subset of
+// sources, even though the missing sources are not actually offline, they are
+// simply slightly delayed in reporting.
+//
+// Linear interpolation can handle small gaps in the middle of data, but it does
+// not work in this case as the current time is later than any data available
+// from the missing sources.
+//
+// In this case, we can assume that a missing data point will be added soon, and
+// instead do *not* return the partially aggregated data point to the client.
+func (ai aggregatingIterator) makeLeadingEdgeFilter(
+	fn func(aggregatingIterator) (float64, bool), leadingEdgeNanos int64,
+) func() (float64, bool) {
+	return func() (float64, bool) {
+		value, valid := fn(ai)
+		if valid {
+			// Only check if the iterator's current offset is later than the cutoff.
+			timestampNanos := ai.timestamp()
+			if timestampNanos > leadingEdgeNanos {
+				// Filter if any component iterators are invalid.
+				if ai.anyInvalid() {
+					valid = false
+				}
+			}
+		}
+		return value, valid
+	}
+}
+
+// getMaxTimespan computes the longest timespan that can be safely queried while
+// remaining within the given memory budget. Inputs are the resolution of data
+// being queried, the budget, the estimated number of sources, and the
+// interpolation limit being used for the query.
+func getMaxTimespan(
+	r Resolution, memoryBudget, estimatedSourceCount, interpolationLimitNanos int64,
+) (int64, error) {
+	slabDuration := r.SlabDuration()
+
+	// Size of slab is the size of a completely full data slab for the supplied
+	// data resolution.
+	sizeOfSlab := sizeOfTimeSeriesData + (slabDuration/r.SampleDuration())*sizeOfSample
+
+	// InterpolationBuffer is the number of slabs outside of the query range
+	// needed to satisfy the interpolation limit. Extra slabs may be queried
+	// on both sides of the target range.
+	interpolationBufferOneSide :=
+		int64(math.Ceil(float64(interpolationLimitNanos) / float64(slabDuration)))
+
+	interpolationBuffer := interpolationBufferOneSide * 2
+
+	// If the (interpolation buffer timespan - interpolation limit) is less than
+	// half of a slab, then it is possible for one additional slab to be queried
+	// that would not have otherwise been queried. This can occur when the queried
+	// timespan does not start on an even slab boundary.
+	if (interpolationBufferOneSide*slabDuration)-interpolationLimitNanos < slabDuration/2 {
+		interpolationBuffer++
+	}
+
+	// The number of slabs that can be queried safely is perSeriesMem/sizeOfSlab,
+	// less the interpolation buffer.
+	perSourceMem := memoryBudget / estimatedSourceCount
+	numSlabs := perSourceMem/sizeOfSlab - interpolationBuffer
+	if numSlabs <= 0 {
+		return 0, fmt.Errorf("insufficient memory budget to attempt query")
+	}
+
+	return numSlabs * slabDuration, nil
+}
+
+// QueryMemoryConstrained executes a query while attempting to limit the maximum
+// amount of memory needed at one time. It accomplishes this by breaking the
+// query into multiple "chunks" as necessary according to the provided memory
+// budget. Chunks are queried sequentially, ensuring that the memory budget
+// applies to only a single chunk at any given time.
+//
+// In addition to the memory budget, an "expected source count" must be provided
+// to this function. This allows the query to better predict how many slabs
+// it will encounter when querying a time span.
+func (db *DB) QueryMemoryConstrained(
+	ctx context.Context,
+	query tspb.Query,
+	queryResolution Resolution,
+	sampleDuration, startNanos, endNanos, interpolationLimitNanos int64,
+	resultAccount *mon.BoundAccount,
+	workerMemMonitor *mon.BytesMonitor,
+	workerMemBudget int64,
+	expectedSourceCount int64,
+) ([]tspb.TimeSeriesDatapoint, []string, error) {
+	maxTimespan, err := getMaxTimespan(
+		queryResolution, workerMemBudget, expectedSourceCount, interpolationLimitNanos,
+	)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	totalTimespan := endNanos - startNanos
+	if maxTimespan >= totalTimespan {
+		return db.Query(
+			ctx,
+			query,
+			queryResolution,
+			sampleDuration,
+			startNanos,
+			endNanos,
+			interpolationLimitNanos,
+			resultAccount,
+			workerMemMonitor,
+		)
+	}
+
+	allData := make([]tspb.TimeSeriesDatapoint, 0)
+	allSourcesMap := make(map[string]struct{})
+	for s, e := startNanos, startNanos+maxTimespan; s < endNanos; s, e = e, e+maxTimespan {
+		// End span is not inclusive for partial queries.
+		adjustedEnd := e - queryResolution.SampleDuration()
+		// Do not exceed the specified endNanos.
+		if adjustedEnd > endNanos {
+			adjustedEnd = endNanos
+		}
+		data, sources, err := db.Query(
+			ctx,
+			query,
+			queryResolution,
+			sampleDuration,
+			s,
+			adjustedEnd,
+			interpolationLimitNanos,
+			resultAccount,
+			workerMemMonitor,
+		)
+		if err != nil {
+			return nil, nil, err
+		}
+		allData = append(allData, data...)
+		for _, source := range sources {
+			allSourcesMap[source] = struct{}{}
+		}
+	}
+
+	allSources := make([]string, 0, len(allSourcesMap))
+	for source := range allSourcesMap {
+		allSources = append(allSources, source)
+	}
+
+	return allData, allSources, nil
 }
 
 // Query returns datapoints for the named time series during the supplied time
@@ -710,35 +925,63 @@ func (db *DB) Query(
 	ctx context.Context,
 	query tspb.Query,
 	queryResolution Resolution,
-	sampleDuration, startNanos, endNanos int64,
+	sampleDuration, startNanos, endNanos, interpolationLimitNanos int64,
+	resultAccount *mon.BoundAccount,
+	workerMemMonitor *mon.BytesMonitor,
 ) ([]tspb.TimeSeriesDatapoint, []string, error) {
+	resolutionSampleDuration := queryResolution.SampleDuration()
 	// Verify that sampleDuration is a multiple of
 	// queryResolution.SampleDuration().
-	if sampleDuration < queryResolution.SampleDuration() {
+	if sampleDuration < resolutionSampleDuration {
 		return nil, nil, fmt.Errorf(
 			"sampleDuration %d was not less that queryResolution.SampleDuration %d",
 			sampleDuration,
-			queryResolution.SampleDuration(),
+			resolutionSampleDuration,
 		)
 	}
-	if sampleDuration%queryResolution.SampleDuration() != 0 {
+	if sampleDuration%resolutionSampleDuration != 0 {
 		return nil, nil, fmt.Errorf(
 			"sampleDuration %d is not a multiple of queryResolution.SampleDuration %d",
 			sampleDuration,
-			queryResolution.SampleDuration(),
+			resolutionSampleDuration,
 		)
+	}
+
+	// Create a local account to track memory usage local to this function.
+	localAccount := workerMemMonitor.MakeBoundAccount()
+	defer localAccount.Close(ctx)
+
+	// Disallow queries in the future.
+	systemTime := timeutil.Now().UnixNano()
+	if startNanos > systemTime {
+		return nil, nil, nil
+	}
+	if endNanos > systemTime {
+		endNanos = systemTime
 	}
 
 	// Normalize startNanos to a sampleDuration boundary.
 	startNanos -= startNanos % sampleDuration
 
+	// If query is near the current moment and we are downsampling, normalize
+	// endNanos to avoid querying an incomplete datapoint.
+	if sampleDuration > resolutionSampleDuration &&
+		endNanos > systemTime-resolutionSampleDuration {
+		endNanos -= endNanos % sampleDuration
+	}
+
 	var rows []client.KeyValue
 	if len(query.Sources) == 0 {
 		// Based on the supplied timestamps and resolution, construct start and
 		// end keys for a scan that will return every key with data relevant to
-		// the query.
-		startKey := MakeDataKey(query.Name, "" /* source */, queryResolution, startNanos)
-		endKey := MakeDataKey(query.Name, "" /* source */, queryResolution, endNanos).PrefixEnd()
+		// the query. Query slightly before and after the actual queried range
+		// to allow interpolation of points at the start and end of the range.
+		startKey := MakeDataKey(
+			query.Name, "" /* source */, queryResolution, startNanos-interpolationLimitNanos,
+		)
+		endKey := MakeDataKey(
+			query.Name, "" /* source */, queryResolution, endNanos+interpolationLimitNanos,
+		).PrefixEnd()
 		b := &client.Batch{}
 		b.Scan(startKey, endKey)
 
@@ -751,8 +994,9 @@ func (db *DB) Query(
 		// Iterate over all key timestamps which may contain data for the given
 		// sources, based on the given start/end time and the resolution.
 		kd := queryResolution.SlabDuration()
-		startKeyNanos := startNanos - (startNanos % kd)
-		endKeyNanos := endNanos - (endNanos % kd)
+		startKeyNanos := startNanos - interpolationLimitNanos
+		startKeyNanos = startKeyNanos - (startKeyNanos % kd)
+		endKeyNanos := endNanos + interpolationLimitNanos
 		for currentTimestamp := startKeyNanos; currentTimestamp <= endKeyNanos; currentTimestamp += kd {
 			for _, source := range query.Sources {
 				key := MakeDataKey(query.Name, source, queryResolution, currentTimestamp)
@@ -774,7 +1018,7 @@ func (db *DB) Query(
 
 	// Convert the queried source data into a set of data spans, one for each
 	// source.
-	sourceSpans, err := makeDataSpans(rows, startNanos)
+	sourceSpans, err := makeDataSpans(ctx, rows, startNanos, &localAccount)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -797,26 +1041,39 @@ func (db *DB) Query(
 	// list of all sources with data present in the query.
 	sources := make([]string, 0, len(sourceSpans))
 	iters := make(aggregatingIterator, 0, len(sourceSpans))
+	maxDistance := int32(interpolationLimitNanos / sampleDuration)
 	for name, span := range sourceSpans {
+		if err := resultAccount.Grow(ctx, int64(len(name))); err != nil {
+			return nil, nil, err
+		}
 		sources = append(sources, name)
 		iters = append(iters, newInterpolatingIterator(
-			*span, 0, sampleDuration, extractor, downsampler, query.GetDerivative(),
+			*span, 0, sampleDuration, maxDistance, extractor, downsampler, query.GetDerivative(),
 		))
 	}
 
 	// Choose an aggregation function to use when taking values from the
 	// aggregatingIterator.
-	var valueFn func() float64
+	var aggFn func(aggregatingIterator) (float64, bool)
 	switch query.GetSourceAggregator() {
 	case tspb.TimeSeriesQueryAggregator_SUM:
-		valueFn = iters.sum
+		aggFn = aggregatingIterator.sum
 	case tspb.TimeSeriesQueryAggregator_AVG:
-		valueFn = iters.avg
+		aggFn = aggregatingIterator.avg
 	case tspb.TimeSeriesQueryAggregator_MAX:
-		valueFn = iters.max
+		aggFn = aggregatingIterator.max
 	case tspb.TimeSeriesQueryAggregator_MIN:
-		valueFn = iters.min
+		aggFn = aggregatingIterator.min
+	default:
+		return nil, nil, fmt.Errorf(
+			"query specified unknown time series aggregator: %s", query.GetSourceAggregator().String(),
+		)
 	}
+
+	// Filter the result of the aggregation function through a leading edge
+	// filter.
+	cutoffNanos := timeutil.Now().UnixNano() - resolutionSampleDuration
+	valueFn := iters.makeLeadingEdgeFilter(aggFn, cutoffNanos)
 
 	// Iterate over all requested offsets, recording a value from the
 	// aggregatingIterator at each offset encountered. If the query is
@@ -829,16 +1086,20 @@ func (db *DB) Query(
 	}
 
 	var responseData []tspb.TimeSeriesDatapoint
-
 	for iters.isValid() && iters.timestamp() <= endNanos {
-		response := tspb.TimeSeriesDatapoint{
-			TimestampNanos: iters.timestamp(),
-			Value:          valueFn(),
+		if value, valid := valueFn(); valid {
+			if err := resultAccount.Grow(ctx, sizeOfDataPoint); err != nil {
+				return nil, nil, err
+			}
+			response := tspb.TimeSeriesDatapoint{
+				TimestampNanos: iters.timestamp(),
+				Value:          value,
+			}
+			if query.GetDerivative() != tspb.TimeSeriesQueryDerivative_NONE {
+				response.Value = response.Value / float64(sampleDuration) * float64(time.Second.Nanoseconds())
+			}
+			responseData = append(responseData, response)
 		}
-		if query.GetDerivative() != tspb.TimeSeriesQueryDerivative_NONE {
-			response.Value = response.Value / float64(sampleDuration) * float64(time.Second.Nanoseconds())
-		}
-		responseData = append(responseData, response)
 		iters.advance()
 	}
 
@@ -848,7 +1109,9 @@ func (db *DB) Query(
 // makeDataSpans constructs a new dataSpan for each distinct source encountered
 // in the query. Each dataspan will contain all data queried from a single
 // source.
-func makeDataSpans(rows []client.KeyValue, startNanos int64) (map[string]*dataSpan, error) {
+func makeDataSpans(
+	ctx context.Context, rows []client.KeyValue, startNanos int64, acc *mon.BoundAccount,
+) (map[string]*dataSpan, error) {
 	sourceSpans := make(map[string]*dataSpan)
 	for _, row := range rows {
 		var data roachpb.InternalTimeSeriesData
@@ -860,20 +1123,28 @@ func makeDataSpans(rows []client.KeyValue, startNanos int64) (map[string]*dataSp
 			return nil, err
 		}
 		if _, ok := sourceSpans[source]; !ok {
+			if err := acc.Grow(ctx, int64(len(source))+sizeOfDataSpan); err != nil {
+				return nil, err
+			}
 			sourceSpans[source] = &dataSpan{
 				startNanos:  startNanos,
 				sampleNanos: data.SampleDurationNanos,
 				datas:       make([]calibratedData, 0, 1),
 			}
 		}
+		if err := acc.Grow(
+			ctx, sizeOfSample*int64(len(data.Samples))+sizeOfCalibratedData,
+		); err != nil {
+			return nil, err
+		}
 		if err := sourceSpans[source].addData(data); err != nil {
 			return nil, err
 		}
 	}
+
 	return sourceSpans, nil
 }
 
-// getExtractionFunction returns
 func getExtractionFunction(agg tspb.TimeSeriesQueryAggregator) (extractFn, error) {
 	switch agg {
 	case tspb.TimeSeriesQueryAggregator_AVG:
@@ -885,7 +1156,7 @@ func getExtractionFunction(agg tspb.TimeSeriesQueryAggregator) (extractFn, error
 	case tspb.TimeSeriesQueryAggregator_MIN:
 		return (roachpb.InternalTimeSeriesSample).Minimum, nil
 	}
-	return nil, errors.Errorf("query specified unknown time series aggregator %s", agg.String())
+	return nil, errors.Errorf("query specified unknown time series downsampler %s", agg.String())
 }
 
 func downsampleSum(points ...roachpb.InternalTimeSeriesSample) float64 {
@@ -926,7 +1197,6 @@ func downsampleAvg(points ...roachpb.InternalTimeSeriesSample) float64 {
 	return total / float64(count)
 }
 
-// getDownsampleFunction returns
 func getDownsampleFunction(agg tspb.TimeSeriesQueryAggregator) (downsampleFn, error) {
 	switch agg {
 	case tspb.TimeSeriesQueryAggregator_AVG:
@@ -938,5 +1208,5 @@ func getDownsampleFunction(agg tspb.TimeSeriesQueryAggregator) (downsampleFn, er
 	case tspb.TimeSeriesQueryAggregator_MIN:
 		return downsampleMin, nil
 	}
-	return nil, errors.Errorf("query specified unknown time series aggregator %s", agg.String())
+	return nil, errors.Errorf("query specified unknown time series downsampler %s", agg.String())
 }

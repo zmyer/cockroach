@@ -11,39 +11,38 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
 // implied. See the License for the specific language governing
 // permissions and limitations under the License.
-//
-// Author: Radu Berinde (radu@cockroachlabs.com)
 
 package distsqlrun
 
 import (
-	"bytes"
 	"fmt"
 	"testing"
 
-	"github.com/cockroachdb/cockroach/pkg/sql/parser"
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/types"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 )
 
 type testVarContainer struct{}
 
-func (d testVarContainer) IndexedVarResolvedType(idx int) parser.Type {
-	return parser.TypeInt
+func (d testVarContainer) IndexedVarResolvedType(idx int) types.T {
+	return types.Int
 }
 
-func (d testVarContainer) IndexedVarEval(idx int, ctx *parser.EvalContext) (parser.Datum, error) {
+func (d testVarContainer) IndexedVarEval(idx int, ctx *tree.EvalContext) (tree.Datum, error) {
 	return nil, nil
 }
 
-func (d testVarContainer) IndexedVarFormat(buf *bytes.Buffer, _ parser.FmtFlags, idx int) {
-	fmt.Fprintf(buf, "var%d", idx)
+func (d testVarContainer) IndexedVarNodeFormatter(idx int) tree.NodeFormatter {
+	n := tree.Name(fmt.Sprintf("var%d", idx))
+	return &n
 }
 
 func TestProcessExpression(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 
 	e := Expression{Expr: "@1 * (@2 + @3) + @1"}
-	h := parser.MakeIndexedVarHelper(testVarContainer{}, 4)
+	h := tree.MakeIndexedVarHelper(testVarContainer{}, 4)
 	expr, err := processExpression(e, &h)
 	if err != nil {
 		t.Fatal(err)

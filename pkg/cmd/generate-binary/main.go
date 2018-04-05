@@ -11,8 +11,6 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
 // implied. See the License for the specific language governing
 // permissions and limitations under the License.
-//
-// Author: Matt Jibson (mjibson@cockroachlabs.com)
 
 // This connects to a postgres server and crafts postgres-protocol message to
 // encode its arguments into postgres' binary encoding. The result is printed
@@ -63,7 +61,6 @@ func main() {
 	var buf bytes.Buffer
 	buf.WriteString("[\n")
 	for i, input := range inputs {
-		input = strings.Trim(input, `"`)
 		enc, err := generator(*postgresAddr, input)
 		if err != nil {
 			panic(fmt.Errorf("%s: %s", input, err))
@@ -73,9 +70,9 @@ func main() {
 `)
 		}
 		buf.WriteString(`	{
-		"In": "`)
-		buf.WriteString(input)
-		buf.WriteString(`",
+		"In": `)
+		fmt.Fprintf(&buf, "%q", input)
+		buf.WriteString(`,
 		"Expect": [`)
 		for i, e := range enc {
 			if i > 0 {
@@ -107,6 +104,11 @@ var defaultVals = map[string][]string{
 	"timestamp":   timestampInputs,
 	"timestamptz": timestampInputs,
 	"date":        dateInputs,
+	"time":        timeInputs,
+	"inet":        inetInputs,
+	"jsonb":       jsonbInputs,
+	"uuid[]":      arrayUUIDInputs,
+	"decimal[]":   arrayDecimalInputs,
 }
 
 var decimalInputs = []string{
@@ -178,6 +180,81 @@ var dateInputs = []string{
 	"9999-01-08",
 	"1999-12-30",
 	"1996-02-29",
+}
+
+var timeInputs = []string{
+	"00:00:00",
+	"12:00:00.000001",
+	"23:59:59.999999",
+}
+
+var inetInputs = []string{
+	"0.0.0.0",
+	"0.0.0.0/20",
+	"0.0.0.0/0",
+	"255.255.255.255",
+	"255.255.255.255/10",
+	"::0/0",
+	"::0/64",
+	"::0",
+	"ffff:ffff:ffff:ffff:ffff:ffff:ffff:ffff",
+	"ffff:ffff:ffff:ffff:ffff:ffff:ffff:ffff/0",
+	"ffff:ffff:ffff:ffff:ffff:ffff:ffff:ffff/10",
+	"0.0.0.1",
+	"111::fff/120",
+	"127.0.0.1/10",
+	"192.168.1.2",
+	"192.168.1.2/16",
+	"192.168.1.2/10",
+	"2001:4f8:3:ba::/64",
+	"2001:4f8:3:ba:2e0:81ff:fe22:d1f1/128",
+	"::ffff:1.2.3.1/120",
+	"::ffff:1.2.3.1/128",
+	"::ffff:1.2.3.1/120",
+	"::ffff:1.2.3.1/20",
+	"::1",
+	"192/10",
+	"192.168/23",
+	"192.168./10",
+}
+
+var jsonbInputs = []string{
+	`123`,
+	`"hello"`,
+	`{}`,
+	`[]`,
+	`0`,
+	`0.0000`,
+	`""`,
+	`"\uD83D\uDE80"`,
+	`{"\uD83D\uDE80": "hello"}`,
+	`[1, 2, 3]`,
+	`{"foo": 123}`,
+	`{"foo": {"bar": true}}`,
+	`true`,
+	`false`,
+	`null`,
+	`[[[[true, false, null]]]]`,
+}
+
+var arrayUUIDInputs = []string{
+	"{00000000-0000-0000-0000-000000000000}",
+	"{9753b405-88c0-4e93-b6c3-4e49fff11b57}",
+	"{be18196d-b20a-4df2-8a2b-259c22842ee8,e0794335-6d39-47d9-b836-1f2ff349bf5d}",
+}
+
+var arrayDecimalInputs = []string{
+	"{-000.000,-0000021234.23246346000000,-1.2,.0,.1,.1234}",
+	"{.12345,0,0.,0.0,0.000006}",
+	"{0.0000124000,0.00005,0.0004,0.003,0.00300,0.02,0.038665987681445668}",
+	"{0.1,00.00,1}",
+	"{1.000000000000006,1.00000000000005,1.0000000000004,1.000000000003,1.00000000002,1.0000000001,1.000000009,1.00000008,1.0000007,1.000006,1.00005,1.0004,1.003,1.02,1.1}",
+	"{10000.000006}",
+	"{10000.00005}",
+	"{10000.0004}",
+	"{10000.003,10000.02,10000.1,1000000,123}",
+	"{12345,12345.1,12345.1234,12345.12345}",
+	"{2.2289971159100284,3409589268520956934250.234098732045120934701239846,42}",
 }
 
 func makeEncodingFunc(typName string) generateEnc {

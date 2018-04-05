@@ -11,8 +11,6 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
 // implied. See the License for the specific language governing
 // permissions and limitations under the License.
-//
-// Author: Marc Berhault (marc@cockroachlabs.com)
 
 package metric
 
@@ -27,7 +25,7 @@ import (
 // PrometheusExporter contains a map of metric families (a metric with multiple labels).
 // It initializes each metric family once and reuses it for each prometheus scrape.
 // It is NOT thread-safe.
-// TODO(marc): we should really keep out metric objects here so we can avoid creating
+// TODO(marc): we should really keep our metric objects here so we can avoid creating
 // new prometheus.Metric every time we are scraped.
 // see: https://github.com/cockroachdb/cockroach/issues/9326
 //  pe := MakePrometheusExporter()

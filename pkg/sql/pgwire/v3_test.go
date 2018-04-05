@@ -11,37 +11,49 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
 // implied. See the License for the specific language governing
 // permissions and limitations under the License.
-//
-// Author: Nathan VanBenschoten (nvanbenschoten@gmail.com)
 
 package pgwire
 
 import (
 	"bytes"
+	"context"
 	"io"
 	"io/ioutil"
 	"net"
 	"testing"
 
-	"golang.org/x/net/context"
-
+	"github.com/cockroachdb/cockroach/pkg/base"
+	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/sql"
-	"github.com/cockroachdb/cockroach/pkg/sql/mon"
+	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgwirebase"
 	"github.com/cockroachdb/cockroach/pkg/util"
+	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/metric"
-	"github.com/cockroachdb/cockroach/pkg/util/tracing"
+	"github.com/cockroachdb/cockroach/pkg/util/mon"
+	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/pkg/errors"
 )
 
 func makeTestV3Conn(c net.Conn) v3Conn {
-	metrics := makeServerMetrics(nil)
-	mon := mon.MakeUnlimitedMonitor(context.Background(), "test", nil, nil, 1000)
+	metrics := makeServerMetrics(nil, metric.TestSampleInterval)
+	st := cluster.MakeTestingClusterSettings()
+	mon := mon.MakeUnlimitedMonitor(
+		context.Background(), "test", mon.MemoryResource, nil, nil, 1000, st,
+	)
+	physicalClock := func() int64 { return timeutil.Now().UnixNano() }
 	exec := sql.NewExecutor(
 		sql.ExecutorConfig{
-			AmbientCtx:            log.AmbientContext{Tracer: tracing.NewTracer()},
-			MetricsSampleInterval: metric.TestSampleInterval,
+			AmbientCtx:              log.AmbientContext{Tracer: st.Tracer},
+			Settings:                st,
+			HistogramWindowInterval: metric.TestSampleInterval,
+			TestingKnobs:            &sql.ExecutorTestingKnobs{},
+			SessionRegistry:         sql.MakeSessionRegistry(),
+			Clock:                   hlc.NewClock(physicalClock, 1),
+			NodeInfo: sql.NodeInfo{
+				NodeID: &base.NodeIDContainer{},
+			},
 		},
 		nil, /* stopper */
 	)
@@ -53,19 +65,19 @@ func makeTestV3Conn(c net.Conn) v3Conn {
 func TestMaliciousInputs(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	for _, data := range [][]byte{
-		// This byte string sends a clientMsgClose message type. When
-		// readBuffer.readUntypedMsg is called, the 4 bytes is subtracted
-		// from the size, leaving a 0-length readBuffer. Following this,
+		// This byte string sends a pgwirebase.ClientMsgClose message type. When
+		// ReadBuffer.readUntypedMsg is called, the 4 bytes is subtracted
+		// from the size, leaving a 0-length ReadBuffer. Following this,
 		// handleClose is called with the empty buffer, which calls
 		// getPrepareType. Previously, getPrepareType would crash on an
 		// empty buffer. This is now fixed.
-		{byte(clientMsgClose), 0x00, 0x00, 0x00, 0x04},
-		// This byte string exploited the same bug using a clientMsgDescribe
+		{byte(pgwirebase.ClientMsgClose), 0x00, 0x00, 0x00, 0x04},
+		// This byte string exploited the same bug using a pgwirebase.ClientMsgDescribe
 		// message type.
-		{byte(clientMsgDescribe), 0x00, 0x00, 0x00, 0x04},
-		// This would cause readBuffer.getInt16 to overflow, resulting in a
+		{byte(pgwirebase.ClientMsgDescribe), 0x00, 0x00, 0x00, 0x04},
+		// This would cause ReadBuffer.getInt16 to overflow, resulting in a
 		// negative value being used for an allocation size.
-		{byte(clientMsgParse), 0x00, 0x00, 0x00, 0x08, 0x00, 0x00, 0xff, 0xff},
+		{byte(pgwirebase.ClientMsgParse), 0x00, 0x00, 0x00, 0x08, 0x00, 0x00, 0xff, 0xff},
 	} {
 		testMaliciousInput(t, data)
 	}
@@ -95,13 +107,17 @@ func testMaliciousInput(t *testing.T, data []byte) {
 		// Sync and terminate if a panic did not occur to stop the server.
 		// We append a 4-byte trailer to each to signify a zero length message. See
 		// lib/pq.conn.sendSimpleMessage for a similar approach to simple messages.
-		_, _ = w.Write([]byte{byte(clientMsgSync), 0x00, 0x00, 0x00, 0x04})
-		_, _ = w.Write([]byte{byte(clientMsgTerminate), 0x00, 0x00, 0x00, 0x04})
+		_, _ = w.Write([]byte{byte(pgwirebase.ClientMsgSync), 0x00, 0x00, 0x00, 0x04})
+		_, _ = w.Write([]byte{byte(pgwirebase.ClientMsgTerminate), 0x00, 0x00, 0x00, 0x04})
 	}()
 
 	v3Conn := makeTestV3Conn(r)
 	defer v3Conn.finish(context.Background())
-	_ = v3Conn.serve(context.Background(), mon.BoundAccount{})
+	_ = v3Conn.serve(
+		context.Background(),
+		func() bool { return false }, /* draining */
+		mon.BoundAccount{},
+	)
 }
 
 // TestReadTimeoutConn asserts that a readTimeoutConn performs reads normally

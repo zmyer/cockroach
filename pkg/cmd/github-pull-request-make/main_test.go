@@ -11,13 +11,12 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
 // implied. See the License for the specific language governing
 // permissions and limitations under the License.
-//
-// Author: Tamir Duberstein (tamird@gmail.com)
 
 package main
 
 import (
 	"os"
+	"path/filepath"
 	"reflect"
 	"testing"
 )
@@ -25,7 +24,10 @@ import (
 func TestPkgsFromDiff(t *testing.T) {
 	for filename, expPkgs := range map[string]map[string]pkg{
 		"testdata/10305.diff": {
-			"pkg/roachpb": {tests: []string{"TestLeaseVerify"}},
+			filepath.Join("pkg", "roachpb"): {tests: []string{"TestLeaseVerify"}},
+		},
+		"testdata/skip.diff": {
+			filepath.Join("pkg", "ccl", "storageccl"): {tests: []string{"TestPutS3"}},
 		},
 	} {
 		t.Run(filename, func(t *testing.T) {

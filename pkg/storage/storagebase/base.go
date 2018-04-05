@@ -11,14 +11,13 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
 // implied. See the License for the specific language governing
 // permissions and limitations under the License.
-//
-// Author: Andrei Matei (andreimatei1@gmail.com)
 
 package storagebase
 
 import (
+	"context"
+
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
-	"golang.org/x/net/context"
 )
 
 // CmdIDKey is a Raft command id.
@@ -32,6 +31,14 @@ type FilterArgs struct {
 	Sid   roachpb.StoreID
 	Req   roachpb.Request
 	Hdr   roachpb.Header
+}
+
+// ProposalFilterArgs groups the arguments to ReplicaProposalFilter.
+type ProposalFilterArgs struct {
+	Ctx   context.Context
+	Cmd   RaftCommand
+	CmdID CmdIDKey
+	Req   roachpb.BatchRequest
 }
 
 // ApplyFilterArgs groups the arguments to a ReplicaApplyFilter.
@@ -48,17 +55,21 @@ func (f *FilterArgs) InRaftCmd() bool {
 	return f.CmdID != ""
 }
 
-// ReplicaCommandFilter may be used in tests through the StorageTestingMocker to
+// ReplicaRequestFilter can be used in testing to influence the error returned
+// from a request before it is evaluated. Notably, the filter is run before the
+// request is added to the CommandQueue, so blocking in the filter will not
+// block interfering requests.
+type ReplicaRequestFilter func(roachpb.BatchRequest) *roachpb.Error
+
+// ReplicaCommandFilter may be used in tests through the StoreTestingKnobs to
 // intercept the handling of commands and artificially generate errors. Return
 // nil to continue with regular processing or non-nil to terminate processing
-// with the returned error. Note that in a multi-replica test this filter will
-// be run once for each replica and must produce consistent results each time.
-//
-// TODO(tschottdorf): clean this up. Tests which use this all need to be
-// refactored to use explicitly a proposal-intercepting filter (not written
-// yet, but it's basically this one here when proposer-evaluated KV is on) or
-// a ReplicaApplyFilter (see below).
+// with the returned error.
 type ReplicaCommandFilter func(args FilterArgs) *roachpb.Error
+
+// ReplicaProposalFilter can be used in testing to influence the error returned
+// from proposals after a request is evaluated but before it is proposed.
+type ReplicaProposalFilter func(args ProposalFilterArgs) *roachpb.Error
 
 // A ReplicaApplyFilter can be used in testing to influence the error returned
 // from proposals after they apply.
@@ -68,3 +79,25 @@ type ReplicaApplyFilter func(args ApplyFilterArgs) *roachpb.Error
 // response returned to a waiting client after a replica command has
 // been processed. This filter is invoked only by the command proposer.
 type ReplicaResponseFilter func(roachpb.BatchRequest, *roachpb.BatchResponse) *roachpb.Error
+
+// CommandQueueAction is an action taken by a BatchRequest's batchCmdSet on the
+// CommandQueue.
+type CommandQueueAction int
+
+const (
+	// CommandQueueWaitForPrereqs represents the state of a batchCmdSet when it
+	// has just inserted itself into the CommandQueue and is beginning to wait
+	// for prereqs to finish execution.
+	CommandQueueWaitForPrereqs CommandQueueAction = iota
+	// CommandQueueCancellation represents the state of a batchCmdSet when it
+	// is canceled while waiting for prerequisites to finish and is forced to
+	// remove itself from the CommandQueue without executing.
+	CommandQueueCancellation
+	// CommandQueueBeginExecuting represents the state of a batchCmdSet when it
+	// has finished waiting for all prereqs to finish execution and is now free
+	// to execute itself.
+	CommandQueueBeginExecuting
+	// CommandQueueFinishExecuting represents the state of a batchCmdSet when it
+	// has finished executing and will remove itself from the CommandQueue.
+	CommandQueueFinishExecuting
+)

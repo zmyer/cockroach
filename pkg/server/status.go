@@ -11,12 +11,15 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
 // implied. See the License for the specific language governing
 // permissions and limitations under the License.
-//
-// Author: Bram Gruneir (bram+code@cockroachlabs.com)
 
 package server
 
 import (
+	"bytes"
+	"context"
+	"crypto/ecdsa"
+	"crypto/rsa"
+	"crypto/x509/pkix"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -24,30 +27,40 @@ import (
 	"reflect"
 	"regexp"
 	"runtime"
+	"runtime/pprof"
 	"strconv"
+	"strings"
 	"sync"
 
 	"github.com/coreos/etcd/raft"
 	gwruntime "github.com/grpc-ecosystem/grpc-gateway/runtime"
 	"github.com/pkg/errors"
-	"golang.org/x/net/context"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/metadata"
+	grpcstatus "google.golang.org/grpc/status"
 
 	"github.com/cockroachdb/cockroach/pkg/base"
 	"github.com/cockroachdb/cockroach/pkg/build"
+	"github.com/cockroachdb/cockroach/pkg/config"
 	"github.com/cockroachdb/cockroach/pkg/gossip"
 	"github.com/cockroachdb/cockroach/pkg/internal/client"
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/rpc"
+	"github.com/cockroachdb/cockroach/pkg/security"
+	"github.com/cockroachdb/cockroach/pkg/server/debug"
 	"github.com/cockroachdb/cockroach/pkg/server/serverpb"
 	"github.com/cockroachdb/cockroach/pkg/server/status"
+	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
+	"github.com/cockroachdb/cockroach/pkg/sql"
 	"github.com/cockroachdb/cockroach/pkg/storage"
 	"github.com/cockroachdb/cockroach/pkg/util/httputil"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
+	"github.com/cockroachdb/cockroach/pkg/util/stop"
 	"github.com/cockroachdb/cockroach/pkg/util/syncutil"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
+	"github.com/cockroachdb/cockroach/pkg/util/tracing"
 )
 
 const (
@@ -62,44 +75,87 @@ const (
 
 	// statusVars exposes prometheus metrics for monitoring consumption.
 	statusVars = statusPrefix + "vars"
+
+	// raftStateDormant is used when there is no known raft state.
+	raftStateDormant = "StateDormant"
+
+	// maxConcurrentRequests is the maximum number of RPC fan-out requests
+	// that will be made at any point of time.
+	maxConcurrentRequests = 100
+
+	// omittedKeyStr is the string returned in place of a key when keys aren't
+	// permitted in responses.
+	omittedKeyStr = "omitted (due to the 'server.remote_debugging.mode' setting)"
 )
 
-// Pattern for local used when determining the node ID.
-var localRE = regexp.MustCompile(`(?i)local`)
+var (
+	// Pattern for local used when determining the node ID.
+	localRE = regexp.MustCompile(`(?i)local`)
+
+	// Error used to convey that remote debugging is needs to be enabled for an
+	// endpoint to be usable.
+	remoteDebuggingErr = grpcstatus.Error(
+		codes.PermissionDenied, "not allowed (due to the 'server.remote_debugging.mode' setting)")
+)
 
 type metricMarshaler interface {
 	json.Marshaler
 	PrintAsText(io.Writer) error
 }
 
+func propagateGatewayMetadata(ctx context.Context) context.Context {
+	if md, ok := metadata.FromIncomingContext(ctx); ok {
+		return metadata.NewOutgoingContext(ctx, md)
+	}
+	return ctx
+}
+
 // A statusServer provides a RESTful status API.
 type statusServer struct {
 	log.AmbientContext
 
-	db           *client.DB
-	gossip       *gossip.Gossip
-	metricSource metricMarshaler
-	rpcCtx       *rpc.Context
-	stores       *storage.Stores
+	st              *cluster.Settings
+	cfg             *base.Config
+	admin           *adminServer
+	db              *client.DB
+	gossip          *gossip.Gossip
+	metricSource    metricMarshaler
+	nodeLiveness    *storage.NodeLiveness
+	rpcCtx          *rpc.Context
+	stores          *storage.Stores
+	stopper         *stop.Stopper
+	sessionRegistry *sql.SessionRegistry
 }
 
 // newStatusServer allocates and returns a statusServer.
 func newStatusServer(
 	ambient log.AmbientContext,
+	st *cluster.Settings,
+	cfg *base.Config,
+	adminServer *adminServer,
 	db *client.DB,
 	gossip *gossip.Gossip,
 	metricSource metricMarshaler,
+	nodeLiveness *storage.NodeLiveness,
 	rpcCtx *rpc.Context,
 	stores *storage.Stores,
+	stopper *stop.Stopper,
+	sessionRegistry *sql.SessionRegistry,
 ) *statusServer {
 	ambient.AddLogTag("status", nil)
 	server := &statusServer{
-		AmbientContext: ambient,
-		db:             db,
-		gossip:         gossip,
-		metricSource:   metricSource,
-		rpcCtx:         rpcCtx,
-		stores:         stores,
+		AmbientContext:  ambient,
+		st:              st,
+		cfg:             cfg,
+		admin:           adminServer,
+		db:              db,
+		gossip:          gossip,
+		metricSource:    metricSource,
+		nodeLiveness:    nodeLiveness,
+		rpcCtx:          rpcCtx,
+		stores:          stores,
+		stopper:         stopper,
+		sessionRegistry: sessionRegistry,
 	}
 
 	return server
@@ -125,20 +181,22 @@ func (s *statusServer) parseNodeID(nodeIDParam string) (roachpb.NodeID, bool, er
 		return s.gossip.NodeID.Get(), true, nil
 	}
 
-	id, err := strconv.ParseInt(nodeIDParam, 10, 64)
+	id, err := strconv.ParseInt(nodeIDParam, 0, 32)
 	if err != nil {
-		return 0, false, fmt.Errorf("node id could not be parsed: %s", err)
+		return 0, false, errors.Wrap(err, "node id could not be parsed")
 	}
 	nodeID := roachpb.NodeID(id)
 	return nodeID, nodeID == s.gossip.NodeID.Get(), nil
 }
 
-func (s *statusServer) dialNode(nodeID roachpb.NodeID) (serverpb.StatusClient, error) {
+func (s *statusServer) dialNode(
+	ctx context.Context, nodeID roachpb.NodeID,
+) (serverpb.StatusClient, error) {
 	addr, err := s.gossip.GetNodeIDAddress(nodeID)
 	if err != nil {
 		return nil, err
 	}
-	conn, err := s.rpcCtx.GRPCDial(addr.String())
+	conn, err := s.rpcCtx.GRPCDial(addr.String()).Connect(ctx)
 	if err != nil {
 		return nil, err
 	}
@@ -149,60 +207,396 @@ func (s *statusServer) dialNode(nodeID roachpb.NodeID) (serverpb.StatusClient, e
 func (s *statusServer) Gossip(
 	ctx context.Context, req *serverpb.GossipRequest,
 ) (*gossip.InfoStatus, error) {
+	if !debug.GatewayRemoteAllowed(ctx, s.st) {
+		return nil, remoteDebuggingErr
+	}
+
+	ctx = propagateGatewayMetadata(ctx)
 	ctx = s.AnnotateCtx(ctx)
 	nodeID, local, err := s.parseNodeID(req.NodeId)
 	if err != nil {
-		return nil, grpc.Errorf(codes.InvalidArgument, err.Error())
+		return nil, grpcstatus.Errorf(codes.InvalidArgument, err.Error())
 	}
 
 	if local {
 		infoStatus := s.gossip.GetInfoStatus()
 		return &infoStatus, nil
 	}
-	status, err := s.dialNode(nodeID)
+	status, err := s.dialNode(ctx, nodeID)
 	if err != nil {
 		return nil, err
 	}
 	return status.Gossip(ctx, req)
 }
 
+// Allocator returns simulated allocator info for the ranges on the given node.
+func (s *statusServer) Allocator(
+	ctx context.Context, req *serverpb.AllocatorRequest,
+) (*serverpb.AllocatorResponse, error) {
+	// TODO(a-robinson): It'd be nice to allow this endpoint and just avoid
+	// logging range start/end keys in the simulated allocator runs.
+	if !debug.GatewayRemoteAllowed(ctx, s.st) {
+		return nil, remoteDebuggingErr
+	}
+
+	ctx = propagateGatewayMetadata(ctx)
+	ctx = s.AnnotateCtx(ctx)
+	nodeID, local, err := s.parseNodeID(req.NodeId)
+	if err != nil {
+		return nil, grpcstatus.Errorf(codes.InvalidArgument, err.Error())
+	}
+
+	if !local {
+		status, err := s.dialNode(ctx, nodeID)
+		if err != nil {
+			return nil, err
+		}
+		return status.Allocator(ctx, req)
+	}
+
+	output := new(serverpb.AllocatorResponse)
+	err = s.stores.VisitStores(func(store *storage.Store) error {
+		// All ranges requested:
+		if len(req.RangeIDs) == 0 {
+			// Use IterateRangeDescriptors to read from the engine only
+			// because it's already exported.
+			err := storage.IterateRangeDescriptors(ctx, store.Engine(),
+				func(desc roachpb.RangeDescriptor) (bool, error) {
+					rep, err := store.GetReplica(desc.RangeID)
+					if err != nil {
+						return true, err
+					}
+					if !rep.OwnsValidLease(store.Clock().Now()) {
+						return false, nil
+					}
+					allocatorSpans, err := store.AllocatorDryRun(ctx, rep)
+					if err != nil {
+						return true, err
+					}
+					output.DryRuns = append(output.DryRuns, &serverpb.AllocatorDryRun{
+						RangeID: desc.RangeID,
+						Events:  recordedSpansToAllocatorEvents(allocatorSpans),
+					})
+					return false, nil
+				})
+			return err
+		}
+
+		// Specific ranges requested:
+		for _, rid := range req.RangeIDs {
+			rep, err := store.GetReplica(rid)
+			if err != nil {
+				// Not found: continue.
+				continue
+			}
+			if !rep.OwnsValidLease(store.Clock().Now()) {
+				continue
+			}
+			allocatorSpans, err := store.AllocatorDryRun(ctx, rep)
+			if err != nil {
+				return err
+			}
+			output.DryRuns = append(output.DryRuns, &serverpb.AllocatorDryRun{
+				RangeID: rep.RangeID,
+				Events:  recordedSpansToAllocatorEvents(allocatorSpans),
+			})
+		}
+		return nil
+	})
+	if err != nil {
+		return nil, grpcstatus.Errorf(codes.Internal, err.Error())
+	}
+	return output, nil
+}
+
+func recordedSpansToAllocatorEvents(
+	spans []tracing.RecordedSpan,
+) []*serverpb.AllocatorDryRun_Event {
+	var output []*serverpb.AllocatorDryRun_Event
+	var buf bytes.Buffer
+	for _, sp := range spans {
+		for _, entry := range sp.Logs {
+			event := &serverpb.AllocatorDryRun_Event{
+				Time: entry.Time,
+			}
+			if len(entry.Fields) == 1 {
+				event.Message = entry.Fields[0].Value
+			} else {
+				buf.Reset()
+				for i, f := range entry.Fields {
+					if i != 0 {
+						buf.WriteByte(' ')
+					}
+					fmt.Fprintf(&buf, "%s:%v", f.Key, f.Value)
+				}
+				event.Message = buf.String()
+			}
+			output = append(output, event)
+		}
+	}
+	return output
+}
+
+// AllocatorRange returns simulated allocator info for the requested range.
+func (s *statusServer) AllocatorRange(
+	ctx context.Context, req *serverpb.AllocatorRangeRequest,
+) (*serverpb.AllocatorRangeResponse, error) {
+	// TODO(a-robinson): It'd be nice to allow this endpoint and just avoid
+	// logging range start/end keys in the simulated allocator runs.
+	if !debug.GatewayRemoteAllowed(ctx, s.st) {
+		return nil, remoteDebuggingErr
+	}
+
+	ctx = propagateGatewayMetadata(ctx)
+	ctx = s.AnnotateCtx(ctx)
+	nodeCtx, cancel := context.WithTimeout(ctx, base.NetworkTimeout)
+	defer cancel()
+
+	isLiveMap := s.nodeLiveness.GetIsLiveMap()
+	type nodeResponse struct {
+		nodeID roachpb.NodeID
+		resp   *serverpb.AllocatorResponse
+		err    error
+	}
+
+	responses := make(chan nodeResponse)
+	// TODO(bram): consider abstracting out this repeated pattern.
+	for nodeID := range isLiveMap {
+		nodeID := nodeID
+		if err := s.stopper.RunAsyncTask(
+			nodeCtx,
+			"server.statusServer: requesting remote Allocator simulation",
+			func(ctx context.Context) {
+				status, err := s.dialNode(ctx, nodeID)
+				var allocatorResponse *serverpb.AllocatorResponse
+				if err == nil {
+					allocatorRequest := &serverpb.AllocatorRequest{
+						RangeIDs: []roachpb.RangeID{roachpb.RangeID(req.RangeId)},
+					}
+					allocatorResponse, err = status.Allocator(ctx, allocatorRequest)
+				}
+				response := nodeResponse{
+					nodeID: nodeID,
+					resp:   allocatorResponse,
+					err:    err,
+				}
+
+				select {
+				case responses <- response:
+					// Response processed.
+				case <-ctx.Done():
+					// Context completed, response no longer needed.
+				}
+			}); err != nil {
+			return nil, grpcstatus.Errorf(codes.Internal, err.Error())
+		}
+	}
+
+	errs := make(map[roachpb.NodeID]error)
+	for remainingResponses := len(isLiveMap); remainingResponses > 0; remainingResponses-- {
+		select {
+		case resp := <-responses:
+			if resp.err != nil {
+				errs[resp.nodeID] = resp.err
+				continue
+			}
+			if len(resp.resp.DryRuns) > 0 {
+				return &serverpb.AllocatorRangeResponse{
+					NodeID: resp.nodeID,
+					DryRun: resp.resp.DryRuns[0],
+				}, nil
+			}
+		case <-ctx.Done():
+			return nil, grpcstatus.Errorf(codes.DeadlineExceeded, "request timed out")
+		}
+	}
+
+	// We didn't get a valid simulated Allocator run. Just return whatever errors
+	// we got instead. If we didn't even get any errors, then there is no active
+	// leaseholder for the range.
+	if len(errs) > 0 {
+		var buf bytes.Buffer
+		for nodeID, err := range errs {
+			if buf.Len() > 0 {
+				buf.WriteByte('\n')
+			}
+			fmt.Fprintf(&buf, "n%d: %s", nodeID, err)
+		}
+		return nil, grpcstatus.Errorf(codes.Internal, buf.String())
+	}
+	return &serverpb.AllocatorRangeResponse{}, nil
+}
+
+// Certificates returns the x509 certificates.
+func (s *statusServer) Certificates(
+	ctx context.Context, req *serverpb.CertificatesRequest,
+) (*serverpb.CertificatesResponse, error) {
+	ctx = propagateGatewayMetadata(ctx)
+	ctx = s.AnnotateCtx(ctx)
+	nodeID, local, err := s.parseNodeID(req.NodeId)
+	if err != nil {
+		return nil, grpcstatus.Errorf(codes.InvalidArgument, err.Error())
+	}
+
+	if s.cfg.Insecure {
+		return nil, errors.New("server is in insecure mode, cannot examine certificates")
+	}
+
+	if !local {
+		status, err := s.dialNode(ctx, nodeID)
+		if err != nil {
+			return nil, err
+		}
+		return status.Certificates(ctx, req)
+	}
+
+	cm, err := s.cfg.GetCertificateManager()
+	if err != nil {
+		return nil, err
+	}
+
+	// The certificate manager gives us a list of CertInfo objects to avoid
+	// making security depend on serverpb.
+	certs, err := cm.ListCertificates()
+	if err != nil {
+		return nil, err
+	}
+
+	cr := &serverpb.CertificatesResponse{}
+	for _, cert := range certs {
+		details := serverpb.CertificateDetails{}
+		switch cert.FileUsage {
+		case security.CAPem:
+			details.Type = serverpb.CertificateDetails_CA
+		case security.NodePem:
+			details.Type = serverpb.CertificateDetails_NODE
+		case security.ClientPem:
+			// Ignore client certificates for now.
+			continue
+		default:
+			return nil, errors.Errorf("unknown certificate type %v for file %s", cert.FileUsage, cert.Filename)
+		}
+
+		if cert.Error == nil {
+			details.Data = cert.FileContents
+			if err := extractCertFields(details.Data, &details); err != nil {
+				details.ErrorMessage = err.Error()
+			}
+		} else {
+			details.ErrorMessage = cert.Error.Error()
+		}
+		cr.Certificates = append(cr.Certificates, details)
+	}
+
+	return cr, nil
+}
+
+func formatCertNames(p pkix.Name) string {
+	return fmt.Sprintf("CommonName=%s, Organization=%s", p.CommonName, strings.Join(p.Organization, ","))
+}
+
+func extractCertFields(contents []byte, details *serverpb.CertificateDetails) error {
+	certs, err := security.PEMContentsToX509(contents)
+	if err != nil {
+		return err
+	}
+
+	for _, c := range certs {
+		addresses := c.DNSNames
+		for _, ip := range c.IPAddresses {
+			addresses = append(addresses, ip.String())
+		}
+
+		extKeyUsage := make([]string, len(c.ExtKeyUsage))
+		for i, eku := range c.ExtKeyUsage {
+			extKeyUsage[i] = security.ExtKeyUsageToString(eku)
+		}
+
+		var pubKeyInfo string
+		if rsaPub, ok := c.PublicKey.(*rsa.PublicKey); ok {
+			pubKeyInfo = fmt.Sprintf("%d bit RSA", rsaPub.N.BitLen())
+		} else if ecdsaPub, ok := c.PublicKey.(*ecdsa.PublicKey); ok {
+			pubKeyInfo = fmt.Sprintf("%d bit ECDSA", ecdsaPub.Params().BitSize)
+		} else {
+			// go's x509 library does not support other types (so far).
+			pubKeyInfo = fmt.Sprintf("unknown key type %T", c.PublicKey)
+		}
+
+		details.Fields = append(details.Fields, serverpb.CertificateDetails_Fields{
+			Issuer:             formatCertNames(c.Issuer),
+			Subject:            formatCertNames(c.Subject),
+			ValidFrom:          c.NotBefore.UnixNano(),
+			ValidUntil:         c.NotAfter.UnixNano(),
+			Addresses:          addresses,
+			SignatureAlgorithm: c.SignatureAlgorithm.String(),
+			PublicKey:          pubKeyInfo,
+			KeyUsage:           security.KeyUsageToString(c.KeyUsage),
+			ExtendedKeyUsage:   extKeyUsage,
+		})
+	}
+	return nil
+}
+
 // Details returns node details.
 func (s *statusServer) Details(
 	ctx context.Context, req *serverpb.DetailsRequest,
 ) (*serverpb.DetailsResponse, error) {
+	ctx = propagateGatewayMetadata(ctx)
 	ctx = s.AnnotateCtx(ctx)
 	nodeID, local, err := s.parseNodeID(req.NodeId)
 	if err != nil {
-		return nil, grpc.Errorf(codes.InvalidArgument, err.Error())
+		return nil, grpcstatus.Errorf(codes.InvalidArgument, err.Error())
 	}
-	if local {
-		resp := &serverpb.DetailsResponse{
-			NodeID:    s.gossip.NodeID.Get(),
-			BuildInfo: build.GetInfo(),
+	if !local {
+		status, err := s.dialNode(ctx, nodeID)
+		if err != nil {
+			return nil, err
 		}
-		if addr, err := s.gossip.GetNodeIDAddress(s.gossip.NodeID.Get()); err == nil {
-			resp.Address = *addr
-		}
+		return status.Details(ctx, req)
+	}
+
+	resp := &serverpb.DetailsResponse{
+		NodeID:    s.gossip.NodeID.Get(),
+		BuildInfo: build.GetInfo(),
+	}
+	if addr, err := s.gossip.GetNodeIDAddress(s.gossip.NodeID.Get()); err == nil {
+		resp.Address = *addr
+	}
+
+	// If Ready is not set, the client doesn't want to know whether this node is
+	// ready to receive client traffic.
+	if !req.Ready {
 		return resp, nil
 	}
-	status, err := s.dialNode(nodeID)
-	if err != nil {
-		return nil, err
+
+	serveMode := s.admin.server.serveMode.get()
+	if serveMode != modeOperational {
+		return nil, grpcstatus.Error(codes.Unavailable, "node is not ready")
 	}
-	return status.Details(ctx, req)
+
+	isHealthy, err := s.nodeLiveness.IsHealthy(nodeID)
+	if err != nil {
+		return nil, grpcstatus.Error(codes.Internal, err.Error())
+	}
+	if !isHealthy {
+		return nil, grpcstatus.Error(codes.Unavailable, "node is not ready")
+	}
+
+	return resp, nil
 }
 
 // LogFilesList returns a list of available log files.
 func (s *statusServer) LogFilesList(
 	ctx context.Context, req *serverpb.LogFilesListRequest,
 ) (*serverpb.LogFilesListResponse, error) {
+	ctx = propagateGatewayMetadata(ctx)
 	ctx = s.AnnotateCtx(ctx)
 	nodeID, local, err := s.parseNodeID(req.NodeId)
 	if err != nil {
-		return nil, grpc.Errorf(codes.InvalidArgument, err.Error())
+		return nil, grpcstatus.Errorf(codes.InvalidArgument, err.Error())
 	}
 	if !local {
-		status, err := s.dialNode(nodeID)
+		status, err := s.dialNode(ctx, nodeID)
 		if err != nil {
 			return nil, err
 		}
@@ -220,13 +614,18 @@ func (s *statusServer) LogFilesList(
 func (s *statusServer) LogFile(
 	ctx context.Context, req *serverpb.LogFileRequest,
 ) (*serverpb.LogEntriesResponse, error) {
+	if !debug.GatewayRemoteAllowed(ctx, s.st) {
+		return nil, remoteDebuggingErr
+	}
+
+	ctx = propagateGatewayMetadata(ctx)
 	ctx = s.AnnotateCtx(ctx)
 	nodeID, local, err := s.parseNodeID(req.NodeId)
 	if err != nil {
-		return nil, grpc.Errorf(codes.InvalidArgument, err.Error())
+		return nil, grpcstatus.Errorf(codes.InvalidArgument, err.Error())
 	}
 	if !local {
-		status, err := s.dialNode(nodeID)
+		status, err := s.dialNode(ctx, nodeID)
 		if err != nil {
 			return nil, err
 		}
@@ -282,56 +681,66 @@ func parseInt64WithDefault(s string, defaultValue int64) (int64, error) {
 //   pattern if it exists. Defaults to nil.
 // * "max" query parameter is the hard limit of the number of returned log
 //   entries. Defaults to defaultMaxLogEntries.
-// * "level" query parameter filters the log entries to be those of the
-//   corresponding severity level or worse. Defaults to "info".
+// To filter the log messages to only retrieve messages from a given level,
+// use a pattern that excludes all messages at the undesired levels.
+// (e.g. "^[^IW]" to only get errors, fatals and panics). An exclusive
+// pattern is better because panics and some other errors do not use
+// a prefix character.
 func (s *statusServer) Logs(
-	_ context.Context, req *serverpb.LogsRequest,
+	ctx context.Context, req *serverpb.LogsRequest,
 ) (*serverpb.LogEntriesResponse, error) {
-	log.Flush()
-
-	var sev log.Severity
-	if len(req.Level) == 0 {
-		sev = log.Severity_INFO
-	} else {
-		var sevFound bool
-		sev, sevFound = log.SeverityByName(req.Level)
-		if !sevFound {
-			return nil, fmt.Errorf("level could not be determined: %s", req.Level)
-		}
+	if !debug.GatewayRemoteAllowed(ctx, s.st) {
+		return nil, remoteDebuggingErr
 	}
+
+	ctx = propagateGatewayMetadata(ctx)
+	ctx = s.AnnotateCtx(ctx)
+	nodeID, local, err := s.parseNodeID(req.NodeId)
+	if err != nil {
+		return nil, grpcstatus.Errorf(codes.InvalidArgument, err.Error())
+	}
+	if !local {
+		status, err := s.dialNode(ctx, nodeID)
+		if err != nil {
+			return nil, err
+		}
+		return status.Logs(ctx, req)
+	}
+
+	log.Flush()
 
 	startTimestamp, err := parseInt64WithDefault(
 		req.StartTime,
 		timeutil.Now().AddDate(0, 0, -1).UnixNano())
 	if err != nil {
-		return nil, grpc.Errorf(codes.InvalidArgument, "StartTime could not be parsed: %s", err)
+		return nil, grpcstatus.Errorf(codes.InvalidArgument, "StartTime could not be parsed: %s", err)
 	}
 
 	endTimestamp, err := parseInt64WithDefault(req.EndTime, timeutil.Now().UnixNano())
 	if err != nil {
-		return nil, grpc.Errorf(codes.InvalidArgument, "EndTime could not be parsed: %s", err)
+		return nil, grpcstatus.Errorf(codes.InvalidArgument, "EndTime could not be parsed: %s", err)
 	}
 
 	if startTimestamp > endTimestamp {
-		return nil, grpc.Errorf(codes.InvalidArgument, "StartTime: %d should not be greater than endtime: %d", startTimestamp, endTimestamp)
+		return nil, grpcstatus.Errorf(codes.InvalidArgument, "StartTime: %d should not be greater than endtime: %d", startTimestamp, endTimestamp)
 	}
 
 	maxEntries, err := parseInt64WithDefault(req.Max, defaultMaxLogEntries)
 	if err != nil {
-		return nil, grpc.Errorf(codes.InvalidArgument, "Max could not be parsed: %s", err)
+		return nil, grpcstatus.Errorf(codes.InvalidArgument, "Max could not be parsed: %s", err)
 	}
 	if maxEntries < 1 {
-		return nil, grpc.Errorf(codes.InvalidArgument, "Max: %d should be set to a value greater than 0", maxEntries)
+		return nil, grpcstatus.Errorf(codes.InvalidArgument, "Max: %d should be set to a value greater than 0", maxEntries)
 	}
 
 	var regex *regexp.Regexp
 	if len(req.Pattern) > 0 {
 		if regex, err = regexp.Compile(req.Pattern); err != nil {
-			return nil, grpc.Errorf(codes.InvalidArgument, "regex pattern could not be compiled: %s", err)
+			return nil, grpcstatus.Errorf(codes.InvalidArgument, "regex pattern could not be compiled: %s", err)
 		}
 	}
 
-	entries, err := log.FetchEntriesFromFiles(sev, startTimestamp, endTimestamp, int(maxEntries), regex)
+	entries, err := log.FetchEntriesFromFiles(startTimestamp, endTimestamp, int(maxEntries), regex)
 	if err != nil {
 		return nil, err
 	}
@@ -342,18 +751,19 @@ func (s *statusServer) Logs(
 // TODO(tschottdorf): significant overlap with /debug/pprof/goroutine, except
 // that this one allows querying by NodeID.
 //
-// Stacks handles returns goroutine stack traces.
+// Stacks returns goroutine stack traces.
 func (s *statusServer) Stacks(
 	ctx context.Context, req *serverpb.StacksRequest,
 ) (*serverpb.JSONResponse, error) {
+	ctx = propagateGatewayMetadata(ctx)
 	ctx = s.AnnotateCtx(ctx)
 	nodeID, local, err := s.parseNodeID(req.NodeId)
 	if err != nil {
-		return nil, grpc.Errorf(codes.InvalidArgument, err.Error())
+		return nil, grpcstatus.Errorf(codes.InvalidArgument, err.Error())
 	}
 
 	if !local {
-		status, err := s.dialNode(nodeID)
+		status, err := s.dialNode(ctx, nodeID)
 		if err != nil {
 			return nil, err
 		}
@@ -374,10 +784,48 @@ func (s *statusServer) Stacks(
 	}
 }
 
+// TODO(tschottdorf): significant overlap with /debug/pprof/heap, except that
+// this one allows querying by NodeID.
+//
+// Profile returns a heap profile.
+func (s *statusServer) Profile(
+	ctx context.Context, req *serverpb.ProfileRequest,
+) (*serverpb.JSONResponse, error) {
+	nodeID, local, err := s.parseNodeID(req.NodeId)
+	if err != nil {
+		return nil, grpcstatus.Errorf(codes.InvalidArgument, err.Error())
+	}
+
+	if !local {
+		status, err := s.dialNode(ctx, nodeID)
+		if err != nil {
+			return nil, err
+		}
+		return status.Profile(ctx, req)
+	}
+
+	switch req.Type {
+	case serverpb.ProfileRequest_HEAP:
+		p := pprof.Lookup("heap")
+		if p == nil {
+			return nil, grpcstatus.Errorf(codes.InvalidArgument, "unable to find profile: heap")
+		}
+		var buf bytes.Buffer
+		if err := p.WriteTo(&buf, 0); err != nil {
+			return nil, grpcstatus.Errorf(codes.Internal, err.Error())
+		}
+		return &serverpb.JSONResponse{Data: buf.Bytes()}, nil
+
+	default:
+		return nil, grpcstatus.Errorf(codes.InvalidArgument, "unknown profile: %s", req.Type)
+	}
+}
+
 // Nodes returns all node statuses.
 func (s *statusServer) Nodes(
 	ctx context.Context, req *serverpb.NodesRequest,
 ) (*serverpb.NodesResponse, error) {
+	ctx = propagateGatewayMetadata(ctx)
 	ctx = s.AnnotateCtx(ctx)
 	startKey := keys.StatusNodePrefix
 	endKey := startKey.PrefixEnd()
@@ -386,7 +834,7 @@ func (s *statusServer) Nodes(
 	b.Scan(startKey, endKey)
 	if err := s.db.Run(ctx, b); err != nil {
 		log.Error(ctx, err)
-		return nil, grpc.Errorf(codes.Internal, err.Error())
+		return nil, grpcstatus.Errorf(codes.Internal, err.Error())
 	}
 	rows := b.Results[0].Rows
 
@@ -396,7 +844,7 @@ func (s *statusServer) Nodes(
 	for i, row := range rows {
 		if err := row.ValueProto(&resp.Nodes[i]); err != nil {
 			log.Error(ctx, err)
-			return nil, grpc.Errorf(codes.Internal, err.Error())
+			return nil, grpcstatus.Errorf(codes.Internal, err.Error())
 		}
 	}
 	return &resp, nil
@@ -406,10 +854,11 @@ func (s *statusServer) Nodes(
 func (s *statusServer) Node(
 	ctx context.Context, req *serverpb.NodeRequest,
 ) (*status.NodeStatus, error) {
+	ctx = propagateGatewayMetadata(ctx)
 	ctx = s.AnnotateCtx(ctx)
 	nodeID, _, err := s.parseNodeID(req.NodeId)
 	if err != nil {
-		return nil, grpc.Errorf(codes.InvalidArgument, err.Error())
+		return nil, grpcstatus.Errorf(codes.InvalidArgument, err.Error())
 	}
 
 	key := keys.NodeStatusKey(nodeID)
@@ -417,14 +866,14 @@ func (s *statusServer) Node(
 	b.Get(key)
 	if err := s.db.Run(ctx, b); err != nil {
 		log.Error(ctx, err)
-		return nil, grpc.Errorf(codes.Internal, err.Error())
+		return nil, grpcstatus.Errorf(codes.Internal, err.Error())
 	}
 
 	var nodeStatus status.NodeStatus
 	if err := b.Results[0].Rows[0].ValueProto(&nodeStatus); err != nil {
 		err = errors.Errorf("could not unmarshal NodeStatus from %s: %s", key, err)
 		log.Error(ctx, err)
-		return nil, grpc.Errorf(codes.Internal, err.Error())
+		return nil, grpcstatus.Errorf(codes.Internal, err.Error())
 	}
 	return &nodeStatus, nil
 }
@@ -433,14 +882,15 @@ func (s *statusServer) Node(
 func (s *statusServer) Metrics(
 	ctx context.Context, req *serverpb.MetricsRequest,
 ) (*serverpb.JSONResponse, error) {
+	ctx = propagateGatewayMetadata(ctx)
 	ctx = s.AnnotateCtx(ctx)
 	nodeID, local, err := s.parseNodeID(req.NodeId)
 	if err != nil {
-		return nil, grpc.Errorf(codes.InvalidArgument, err.Error())
+		return nil, grpcstatus.Errorf(codes.InvalidArgument, err.Error())
 	}
 
 	if !local {
-		status, err := s.dialNode(nodeID)
+		status, err := s.dialNode(ctx, nodeID)
 		if err != nil {
 			return nil, err
 		}
@@ -451,8 +901,9 @@ func (s *statusServer) Metrics(
 
 // RaftDebug returns raft debug information for all known nodes.
 func (s *statusServer) RaftDebug(
-	ctx context.Context, _ *serverpb.RaftDebugRequest,
+	ctx context.Context, req *serverpb.RaftDebugRequest,
 ) (*serverpb.RaftDebugResponse, error) {
+	ctx = propagateGatewayMetadata(ctx)
 	ctx = s.AnnotateCtx(ctx)
 	nodes, err := s.Nodes(ctx, nil)
 	if err != nil {
@@ -483,7 +934,7 @@ func (s *statusServer) RaftDebug(
 		nodeID := node.Desc.NodeID
 		go func() {
 			defer wg.Done()
-			ranges, err := s.Ranges(ctx, &serverpb.RangesRequest{NodeId: nodeID.String()})
+			ranges, err := s.Ranges(ctx, &serverpb.RangesRequest{NodeId: nodeID.String(), RangeIDs: req.RangeIDs})
 
 			mu.Lock()
 			defer mu.Unlock()
@@ -533,7 +984,7 @@ func (s *statusServer) RaftDebug(
 			// Check for replica descs not matching.
 			if j > 0 {
 				prevDesc := rng.Nodes[j-1].Range.State.Desc
-				if !reflect.DeepEqual(&desc, &prevDesc) {
+				if !desc.Equal(prevDesc) {
 					prevNodeID := rng.Nodes[j-1].NodeID
 					rng.Errors = append(rng.Errors, serverpb.RaftRangeError{
 						Message: fmt.Sprintf("node %d range descriptor does not match node %d", node.NodeID, prevNodeID),
@@ -555,18 +1006,19 @@ func (s *statusServer) handleVars(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-// Ranges returns range info for the server specified
+// Ranges returns range info for the specified node.
 func (s *statusServer) Ranges(
 	ctx context.Context, req *serverpb.RangesRequest,
 ) (*serverpb.RangesResponse, error) {
+	ctx = propagateGatewayMetadata(ctx)
 	ctx = s.AnnotateCtx(ctx)
 	nodeID, local, err := s.parseNodeID(req.NodeId)
 	if err != nil {
-		return nil, grpc.Errorf(codes.InvalidArgument, err.Error())
+		return nil, grpcstatus.Errorf(codes.InvalidArgument, err.Error())
 	}
 
 	if !local {
-		status, err := s.dialNode(nodeID)
+		status, err := s.dialNode(ctx, nodeID)
 		if err != nil {
 			return nil, err
 		}
@@ -578,21 +1030,22 @@ func (s *statusServer) Ranges(
 	}
 
 	convertRaftStatus := func(raftStatus *raft.Status) serverpb.RaftState {
-		var state serverpb.RaftState
 		if raftStatus == nil {
-			state.State = "StateDormant"
-			return state
+			return serverpb.RaftState{
+				State: raftStateDormant,
+			}
 		}
 
-		state.ReplicaID = raftStatus.ID
-		state.HardState = raftStatus.HardState
-		state.Applied = raftStatus.Applied
+		state := serverpb.RaftState{
+			ReplicaID:      raftStatus.ID,
+			HardState:      raftStatus.HardState,
+			Applied:        raftStatus.Applied,
+			Lead:           raftStatus.Lead,
+			State:          raftStatus.RaftState.String(),
+			Progress:       make(map[uint64]serverpb.RaftState_Progress),
+			LeadTransferee: raftStatus.LeadTransferee,
+		}
 
-		// Grab Lead and State, which together form the SoftState.
-		state.Lead = raftStatus.Lead
-		state.State = raftStatus.RaftState.String()
-
-		state.Progress = make(map[uint64]serverpb.RaftState_Progress)
 		for id, progress := range raftStatus.Progress {
 			state.Progress[id] = serverpb.RaftState_Progress{
 				Match:           progress.Match,
@@ -606,31 +1059,380 @@ func (s *statusServer) Ranges(
 		return state
 	}
 
+	includeRawKeys := debug.GatewayRemoteAllowed(ctx, s.st)
+
+	constructRangeInfo := func(
+		desc roachpb.RangeDescriptor, rep *storage.Replica, storeID roachpb.StoreID, metrics storage.ReplicaMetrics,
+	) serverpb.RangeInfo {
+		raftStatus := rep.RaftStatus()
+		raftState := convertRaftStatus(raftStatus)
+		leaseHistory := rep.GetLeaseHistory()
+		var span serverpb.PrettySpan
+		if includeRawKeys {
+			span.StartKey = desc.StartKey.String()
+			span.EndKey = desc.EndKey.String()
+		} else {
+			span.StartKey = omittedKeyStr
+			span.EndKey = omittedKeyStr
+		}
+		state := rep.State()
+		if !includeRawKeys {
+			state.ReplicaState.Desc.StartKey = nil
+			state.ReplicaState.Desc.EndKey = nil
+		}
+		return serverpb.RangeInfo{
+			Span:          span,
+			RaftState:     raftState,
+			State:         state,
+			SourceNodeID:  nodeID,
+			SourceStoreID: storeID,
+			LeaseHistory:  leaseHistory,
+			Stats: serverpb.RangeStatistics{
+				QueriesPerSecond: rep.QueriesPerSecond(),
+				WritesPerSecond:  rep.WritesPerSecond(),
+			},
+			Problems: serverpb.RangeProblems{
+				Unavailable:          metrics.Unavailable,
+				LeaderNotLeaseHolder: metrics.Leader && metrics.LeaseValid && !metrics.Leaseholder,
+				NoRaftLeader:         !storage.HasRaftLeader(raftStatus) && !metrics.Quiescent,
+				Underreplicated:      metrics.Underreplicated,
+				NoLease:              metrics.Leader && !metrics.LeaseValid && !metrics.Quiescent,
+			},
+			CmdQLocal:   serverpb.CommandQueueMetrics(metrics.CmdQMetricsLocal),
+			CmdQGlobal:  serverpb.CommandQueueMetrics(metrics.CmdQMetricsGlobal),
+			LeaseStatus: metrics.LeaseStatus,
+			Quiescent:   metrics.Quiescent,
+		}
+	}
+
+	cfg, ok := s.gossip.GetSystemConfig()
+	if !ok {
+		// Very little on the status pages requires the system config -- as of June
+		// 2017, only the underreplicated range metric does. Refusing to return a
+		// status page (that may help debug why the config isn't available) due to
+		// such a small piece of missing information is overly harsh.
+		log.Error(ctx, "system config not yet available, serving status page without it")
+		cfg = config.SystemConfig{}
+	}
+	isLiveMap := s.nodeLiveness.GetIsLiveMap()
+
 	err = s.stores.VisitStores(func(store *storage.Store) error {
-		// Use IterateRangeDescriptors to read from the engine only
-		// because it's already exported.
-		err := storage.IterateRangeDescriptors(ctx, store.Engine(),
-			func(desc roachpb.RangeDescriptor) (bool, error) {
-				rep, err := store.GetReplica(desc.RangeID)
-				if err != nil {
-					return true, err
-				}
-				output.Ranges = append(output.Ranges, serverpb.RangeInfo{
-					Span: serverpb.PrettySpan{
-						StartKey: desc.StartKey.String(),
-						EndKey:   desc.EndKey.String(),
-					},
-					RaftState: convertRaftStatus(rep.RaftStatus()),
-					State:     rep.State(),
+		timestamp := store.Clock().Now()
+		if len(req.RangeIDs) == 0 {
+			// All ranges requested.
+
+			// Use IterateRangeDescriptors to read from the engine only
+			// because it's already exported.
+			err := storage.IterateRangeDescriptors(ctx, store.Engine(),
+				func(desc roachpb.RangeDescriptor) (bool, error) {
+					rep, err := store.GetReplica(desc.RangeID)
+					if err != nil {
+						return true, err
+					}
+					output.Ranges = append(output.Ranges,
+						constructRangeInfo(
+							desc,
+							rep,
+							store.Ident.StoreID,
+							rep.Metrics(ctx, timestamp, cfg, isLiveMap),
+						))
+					return false, nil
 				})
-				return false, nil
-			})
-		return err
+			return err
+		}
+
+		// Specific ranges requested:
+		for _, rid := range req.RangeIDs {
+			rep, err := store.GetReplica(rid)
+			if err != nil {
+				// Not found: continue.
+				continue
+			}
+			desc := rep.Desc()
+			output.Ranges = append(output.Ranges,
+				constructRangeInfo(
+					*desc,
+					rep,
+					store.Ident.StoreID,
+					rep.Metrics(ctx, timestamp, cfg, isLiveMap),
+				))
+		}
+		return nil
 	})
 	if err != nil {
-		return nil, grpc.Errorf(codes.Internal, err.Error())
+		return nil, grpcstatus.Errorf(codes.Internal, err.Error())
 	}
 	return &output, nil
+}
+
+// Range returns rangeInfos for all nodes in the cluster about a specific
+// range. It also returns the range history for that range as well.
+func (s *statusServer) Range(
+	ctx context.Context, req *serverpb.RangeRequest,
+) (*serverpb.RangeResponse, error) {
+	ctx = propagateGatewayMetadata(ctx)
+	ctx = s.AnnotateCtx(ctx)
+	response := &serverpb.RangeResponse{
+		RangeID:           roachpb.RangeID(req.RangeId),
+		NodeID:            s.gossip.NodeID.Get(),
+		ResponsesByNodeID: make(map[roachpb.NodeID]serverpb.RangeResponse_NodeResponse),
+	}
+
+	nodeCtx, cancel := context.WithTimeout(ctx, base.NetworkTimeout)
+	defer cancel()
+
+	isLiveMap := s.nodeLiveness.GetIsLiveMap()
+	type nodeResponse struct {
+		nodeID roachpb.NodeID
+		resp   *serverpb.RangesResponse
+		err    error
+	}
+
+	responses := make(chan nodeResponse)
+	// TODO(bram): consider abstracting out this repeated pattern.
+	for nodeID := range isLiveMap {
+		nodeID := nodeID
+		if err := s.stopper.RunAsyncTask(
+			nodeCtx,
+			"server.statusServer: requesting remote ranges",
+			func(ctx context.Context) {
+				status, err := s.dialNode(ctx, nodeID)
+				var rangesResponse *serverpb.RangesResponse
+				if err == nil {
+					rangesRequest := &serverpb.RangesRequest{
+						RangeIDs: []roachpb.RangeID{roachpb.RangeID(req.RangeId)},
+					}
+					rangesResponse, err = status.Ranges(ctx, rangesRequest)
+				}
+				response := nodeResponse{
+					nodeID: nodeID,
+					resp:   rangesResponse,
+					err:    err,
+				}
+
+				select {
+				case responses <- response:
+					// Response processed.
+				case <-ctx.Done():
+					// Context completed, response no longer needed.
+				}
+			}); err != nil {
+			return nil, grpcstatus.Errorf(codes.Internal, err.Error())
+		}
+	}
+	for remainingResponses := len(isLiveMap); remainingResponses > 0; remainingResponses-- {
+		select {
+		case resp := <-responses:
+			if resp.err != nil {
+				response.ResponsesByNodeID[resp.nodeID] = serverpb.RangeResponse_NodeResponse{
+					ErrorMessage: resp.err.Error(),
+				}
+				continue
+			}
+			response.ResponsesByNodeID[resp.nodeID] = serverpb.RangeResponse_NodeResponse{
+				Response: true,
+				Infos:    resp.resp.Ranges,
+			}
+		case <-ctx.Done():
+			return nil, grpcstatus.Errorf(codes.DeadlineExceeded, "request timed out")
+		}
+	}
+
+	return response, nil
+}
+
+// CommandQueue returns a snapshot of the command queue state for the
+// specified range.
+func (s *statusServer) CommandQueue(
+	ctx context.Context, req *serverpb.CommandQueueRequest,
+) (*serverpb.CommandQueueResponse, error) {
+	rangeID := roachpb.RangeID(req.RangeId)
+	replica, err := s.stores.GetReplicaForRangeID(rangeID)
+	if err != nil {
+		return nil, err
+	}
+
+	if replica == nil {
+		return nil, roachpb.NewRangeNotFoundError(rangeID)
+	}
+
+	return &serverpb.CommandQueueResponse{
+		Snapshot: replica.GetCommandQueueSnapshot(),
+	}, nil
+}
+
+// ListLocalSessions returns a list of SQL sessions on this node.
+func (s *statusServer) ListLocalSessions(
+	ctx context.Context, req *serverpb.ListSessionsRequest,
+) (*serverpb.ListSessionsResponse, error) {
+	ctx = propagateGatewayMetadata(ctx)
+	if !debug.GatewayRemoteAllowed(ctx, s.st) {
+		return nil, remoteDebuggingErr
+	}
+
+	registry := s.sessionRegistry
+
+	sessions := registry.SerializeAll()
+	userSessions := make([]serverpb.Session, 0, len(sessions))
+
+	for _, session := range sessions {
+		if !(req.Username == security.RootUser || req.Username == session.Username) {
+			continue
+		}
+
+		session.NodeID = s.gossip.NodeID.Get()
+		userSessions = append(userSessions, session)
+	}
+
+	return &serverpb.ListSessionsResponse{Sessions: userSessions}, nil
+}
+
+// ListSessions returns a list of SQL sessions on all nodes in the cluster.
+func (s *statusServer) ListSessions(
+	ctx context.Context, req *serverpb.ListSessionsRequest,
+) (*serverpb.ListSessionsResponse, error) {
+	ctx = propagateGatewayMetadata(ctx)
+	if !debug.GatewayRemoteAllowed(ctx, s.st) {
+		return nil, remoteDebuggingErr
+	}
+
+	ctx = s.AnnotateCtx(ctx)
+	nodes, err := s.Nodes(ctx, nil)
+	if err != nil {
+		return nil, err
+	}
+
+	resp := serverpb.ListSessionsResponse{
+		Sessions: make([]serverpb.Session, 0),
+		Errors:   make([]serverpb.ListSessionsError, 0),
+	}
+
+	// Issue LocalSessions requests in parallel.
+	// Semaphore that guarantees not more than maxConcurrentRequests requests at once.
+	sem := make(chan struct{}, maxConcurrentRequests)
+	numNodes := len(nodes.Nodes)
+
+	// Channel for session responses and errors.
+	sessionsChan := make(chan *serverpb.ListSessionsResponse, numNodes)
+	errorsChan := make(chan serverpb.ListSessionsError, numNodes)
+
+	getNodeSessions := func(ctx context.Context, nodeID roachpb.NodeID) {
+		rpcCtx, cancel := context.WithTimeout(ctx, base.NetworkTimeout)
+		defer cancel()
+
+		status, err := s.dialNode(ctx, nodeID)
+
+		if err != nil {
+			err = errors.Wrapf(err, "failed to dial into node %d", nodeID)
+			errorsChan <- serverpb.ListSessionsError{
+				NodeID:  nodeID,
+				Message: err.Error(),
+			}
+			return
+		}
+
+		sessions, err := status.ListLocalSessions(rpcCtx, req)
+
+		if err != nil {
+			err = errors.Wrapf(err, "failed to get sessions from node %d", nodeID)
+			errorsChan <- serverpb.ListSessionsError{
+				NodeID:  nodeID,
+				Message: err.Error(),
+			}
+			return
+		}
+
+		sessionsChan <- sessions
+	}
+
+	for _, node := range nodes.Nodes {
+		nodeID := node.Desc.NodeID
+		getNodeSessionsTask := func(ctx context.Context) {
+			getNodeSessions(ctx, nodeID)
+		}
+		if err := s.stopper.RunLimitedAsyncTask(
+			ctx, "server.statusServe: requesting remote sessions", sem, true /* wait */, getNodeSessionsTask,
+		); err != nil {
+			return nil, err
+		}
+	}
+
+	for numNodes > 0 {
+		select {
+		case sessions := <-sessionsChan:
+			resp.Sessions = append(resp.Sessions, sessions.Sessions...)
+		case err := <-errorsChan:
+			resp.Errors = append(resp.Errors, err)
+		case <-ctx.Done():
+			err := serverpb.ListSessionsError{Message: "ListSessions canceled before completion"}
+			resp.Errors = append(resp.Errors, err)
+		}
+		numNodes--
+	}
+	return &resp, nil
+}
+
+// CancelSession responds to a session cancellation request by canceling the
+// target session's associated context.
+func (s *statusServer) CancelSession(
+	ctx context.Context, req *serverpb.CancelSessionRequest,
+) (*serverpb.CancelSessionResponse, error) {
+	ctx = s.AnnotateCtx(ctx)
+	nodeID, local, err := s.parseNodeID(req.NodeId)
+
+	if err != nil {
+		return nil, grpcstatus.Errorf(codes.InvalidArgument, err.Error())
+	}
+
+	if !local {
+		status, err := s.dialNode(ctx, nodeID)
+		if err != nil {
+			return nil, err
+		}
+		return status.CancelSession(ctx, req)
+	}
+
+	output := &serverpb.CancelSessionResponse{}
+	canceled, err := s.sessionRegistry.CancelSession(req.SessionID, req.Username)
+
+	if err != nil {
+		output.Error = err.Error()
+	}
+
+	output.Canceled = canceled
+	return output, nil
+}
+
+// CancelQuery responds to a query cancellation request, and cancels
+// the target query's associated context and sets a cancellation flag.
+func (s *statusServer) CancelQuery(
+	ctx context.Context, req *serverpb.CancelQueryRequest,
+) (*serverpb.CancelQueryResponse, error) {
+	ctx = propagateGatewayMetadata(ctx)
+	ctx = s.AnnotateCtx(ctx)
+	nodeID, local, err := s.parseNodeID(req.NodeId)
+
+	if err != nil {
+		return nil, grpcstatus.Errorf(codes.InvalidArgument, err.Error())
+	}
+
+	if !local {
+		status, err := s.dialNode(ctx, nodeID)
+		if err != nil {
+			return nil, err
+		}
+		return status.CancelQuery(ctx, req)
+	}
+
+	output := &serverpb.CancelQueryResponse{}
+	canceled, err := s.sessionRegistry.CancelQuery(req.QueryID, req.Username)
+
+	if err != nil {
+		output.Error = err.Error()
+	}
+
+	output.Canceled = canceled
+	return output, nil
 }
 
 // SpanStats requests the total statistics stored on a node for a given key
@@ -638,14 +1440,15 @@ func (s *statusServer) Ranges(
 func (s *statusServer) SpanStats(
 	ctx context.Context, req *serverpb.SpanStatsRequest,
 ) (*serverpb.SpanStatsResponse, error) {
+	ctx = propagateGatewayMetadata(ctx)
 	ctx = s.AnnotateCtx(ctx)
 	nodeID, local, err := s.parseNodeID(req.NodeID)
 	if err != nil {
-		return nil, grpc.Errorf(codes.InvalidArgument, err.Error())
+		return nil, grpcstatus.Errorf(codes.InvalidArgument, err.Error())
 	}
 
 	if !local {
-		status, err := s.dialNode(nodeID)
+		status, err := s.dialNode(ctx, nodeID)
 		if err != nil {
 			return nil, err
 		}
@@ -654,9 +1457,13 @@ func (s *statusServer) SpanStats(
 
 	output := &serverpb.SpanStatsResponse{}
 	err = s.stores.VisitStores(func(store *storage.Store) error {
-		stats, count := store.ComputeStatsForKeySpan(req.StartKey.Next(), req.EndKey)
-		output.TotalStats.Add(stats)
-		output.RangeCount += int32(count)
+		result, err := store.ComputeStatsForKeySpan(req.StartKey.Next(), req.EndKey)
+		if err != nil {
+			return err
+		}
+		output.TotalStats.Add(result.MVCC)
+		output.RangeCount += int32(result.ReplicaCount)
+		output.ApproximateDiskBytes += result.ApproximateDiskBytes
 		return nil
 	})
 	if err != nil {
@@ -678,7 +1485,7 @@ type jsonWrapper struct {
 }
 
 // marshalToJSON marshals the given value into nicely indented JSON. If the
-// value is an array or slice it is wrapped in jsonWrapper and then marshalled.
+// value is an array or slice it is wrapped in jsonWrapper and then marshaled.
 func marshalToJSON(value interface{}) ([]byte, error) {
 	switch reflect.ValueOf(value).Kind() {
 	case reflect.Array, reflect.Slice:

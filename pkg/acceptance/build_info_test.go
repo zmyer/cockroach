@@ -11,31 +11,36 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
 // implied. See the License for the specific language governing
 // permissions and limitations under the License.
-//
-// Author: Peter Mattis (peter@cockroachlabs.com)
 
 package acceptance
 
 import (
+	"context"
 	"testing"
 	"time"
-
-	"golang.org/x/net/context"
 
 	"github.com/cockroachdb/cockroach/pkg/acceptance/cluster"
 	"github.com/cockroachdb/cockroach/pkg/server/serverpb"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
 	"github.com/cockroachdb/cockroach/pkg/util/httputil"
+	"github.com/cockroachdb/cockroach/pkg/util/log"
 )
 
 func TestBuildInfo(t *testing.T) {
-	runTestOnConfigs(t, testBuildInfoInner)
+	s := log.Scope(t)
+	defer s.Close(t)
+
+	RunLocal(t, func(t *testing.T) {
+		runTestWithCluster(t, testBuildInfoInner)
+	})
 }
 
 func testBuildInfoInner(
 	ctx context.Context, t *testing.T, c cluster.Cluster, cfg cluster.TestConfig,
 ) {
-	CheckGossip(ctx, t, c, 20*time.Second, HasPeers(c.NumNodes()))
+	if err := CheckGossip(ctx, c, 20*time.Second, HasPeers(c.NumNodes())); err != nil {
+		t.Fatal(err)
+	}
 
 	var details serverpb.DetailsResponse
 	testutils.SucceedsSoon(t, func() error {
@@ -49,10 +54,10 @@ func testBuildInfoInner(
 
 	bi := details.BuildInfo
 	testData := map[string]string{
-		"go_version":   bi.GoVersion,
-		"tag":          bi.Tag,
-		"time":         bi.Time,
-		"dependencies": bi.Dependencies,
+		"go_version": bi.GoVersion,
+		"tag":        bi.Tag,
+		"time":       bi.Time,
+		"revision":   bi.Revision,
 	}
 	for key, val := range testData {
 		if val == "" {

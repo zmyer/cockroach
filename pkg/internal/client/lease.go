@@ -15,21 +15,22 @@
 package client
 
 import (
+	"context"
 	"fmt"
 	"time"
 
-	"golang.org/x/net/context"
+	"github.com/pkg/errors"
 
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
+	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/cockroachdb/cockroach/pkg/util/uuid"
-	"github.com/pkg/errors"
 )
 
 // DefaultLeaseDuration is the duration a lease will be acquired for if no
 // duration was specified in a LeaseManager's options.
 // Exported for testing purposes.
-const DefaultLeaseDuration = time.Minute
+const DefaultLeaseDuration = 1 * time.Minute
 
 // LeaseNotAvailableError indicates that the lease the caller attempted to
 // acquire is currently held by a different client.
@@ -91,9 +92,9 @@ func (m *LeaseManager) AcquireLease(ctx context.Context, key roachpb.Key) (*Leas
 	lease := &Lease{
 		key: key,
 	}
-	if err := m.db.Txn(ctx, func(txn *Txn) error {
+	if err := m.db.Txn(ctx, func(ctx context.Context, txn *Txn) error {
 		var val LeaseVal
-		err := txn.GetProto(key, &val)
+		err := txn.GetProto(ctx, key, &val)
 		if err != nil {
 			return err
 		}
@@ -104,7 +105,7 @@ func (m *LeaseManager) AcquireLease(ctx context.Context, key roachpb.Key) (*Leas
 			Owner:      m.clientID,
 			Expiration: m.clock.Now().Add(m.leaseDuration.Nanoseconds(), 0),
 		}
-		return txn.Put(key, lease.val)
+		return txn.Put(ctx, key, lease.val)
 	}); err != nil {
 		return nil, err
 	}
@@ -121,7 +122,13 @@ func (m *LeaseManager) TimeRemaining(l *Lease) time.Duration {
 }
 
 func (m *LeaseManager) timeRemaining(val *LeaseVal) time.Duration {
-	return val.Expiration.GoTime().Sub(m.clock.Now().GoTime()) - m.clock.MaxOffset()
+	maxOffset := m.clock.MaxOffset()
+	if maxOffset == timeutil.ClocklessMaxOffset {
+		// Clockless reads are active, so we don't need to stop using the lease
+		// early.
+		maxOffset = 0
+	}
+	return val.Expiration.GoTime().Sub(m.clock.Now().GoTime()) - maxOffset
 }
 
 // ExtendLease attempts to push the expiration time of the lease farther out
@@ -136,12 +143,11 @@ func (m *LeaseManager) ExtendLease(ctx context.Context, l *Lease) error {
 		Expiration: m.clock.Now().Add(m.leaseDuration.Nanoseconds(), 0),
 	}
 
-	err := m.db.CPut(ctx, l.key, newVal, l.val)
-	if err != nil {
+	if err := m.db.CPut(ctx, l.key, newVal, l.val); err != nil {
 		if _, ok := err.(*roachpb.ConditionFailedError); ok {
 			// Something is wrong - immediately expire the local lease state.
-			l.val.Expiration = hlc.ZeroTimestamp
-			return errors.Wrap(err, "local lease state %v out of sync with DB state")
+			l.val.Expiration = hlc.Timestamp{}
+			return errors.Wrapf(err, "local lease state %v out of sync with DB state", l.val)
 		}
 		return err
 	}

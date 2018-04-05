@@ -11,8 +11,6 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
 // implied. See the License for the specific language governing
 // permissions and limitations under the License.
-//
-// Author: Tobias Schottdorf (tobias.schottdorf@gmail.com)
 
 package metric
 
@@ -187,10 +185,10 @@ func NewHistogram(metadata Metadata, duration time.Duration, maxVal int64, sigFi
 // with one digit of precision (i.e. errors of <10ms at 100ms, <6s at 60s).
 //
 // The windowed portion of the Histogram retains values for approximately
-// sampleDuration.
-func NewLatency(metadata Metadata, sampleDuration time.Duration) *Histogram {
+// histogramWindow.
+func NewLatency(metadata Metadata, histogramWindow time.Duration) *Histogram {
 	return NewHistogram(
-		metadata, sampleDuration, MaxLatency.Nanoseconds(), 1,
+		metadata, histogramWindow, MaxLatency.Nanoseconds(), 1,
 	)
 }
 
@@ -297,6 +295,16 @@ type Counter struct {
 // NewCounter creates a counter.
 func NewCounter(metadata Metadata) *Counter {
 	return &Counter{metadata, metrics.NewCounter()}
+}
+
+// Dec overrides the metric.Counter method. This method should NOT be
+// used and serves only to prevent misuse of the metric type.
+func (c *Counter) Dec(int64) {
+	// From https://prometheus.io/docs/concepts/metric_types/#counter
+	// > Counters should not be used to expose current counts of items
+	// > whose number can also go down, e.g. the number of currently
+	// > running goroutines. Use gauges for this use case.
+	panic("Counter should not be decremented, use a Gauge instead")
 }
 
 // GetType returns the prometheus type enum for this metric.

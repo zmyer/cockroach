@@ -1,0 +1,514 @@
+# scalar.opt contains Optgen language definitions for all of Cockroach's
+# physical and logical operators that return a single result value having a
+# simple scalar type like string or float, rather than a table-valued type.
+#
+# Tags
+#
+# Scalar - All operators in this file are marked with the Scalar tag, so they
+#          can be easily distinguished from Relational and Enforcer operators.
+
+# Subquery is a subquery in a single-row context such as
+# `SELECT 1 = (SELECT 1)` or `SELECT (1, 'a') = (SELECT 1, 'a')`.
+# In a single-row context, the outer query is only valid if the subquery
+# returns at most one row.
+#
+# Subqueries in a multi-row context such as
+# `SELECT 1 IN (SELECT c FROM t)` or `SELECT (1, 'a') IN (SELECT 1, 'a')`
+# can be transformed to a single row context using the Any operator. (Note that
+# this is different from the SQL ANY operator. See the comment above the Any
+# operator for more details.)
+#
+# We use the following transformations:
+# - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
+# `<var> IN (<subquery>)`
+#    ==> `Any(SELECT <var> = x FROM (<subquery>) AS q(x))`
+#
+# `<var> NOT IN (<subquery>)`
+#    ==> `NOT Any(SELECT <var> = x FROM (<subquery>) AS q(x))`
+#
+# `<var> <comp> {SOME|ANY}(<subquery>)`
+#    ==> `Any(SELECT <var> <comp> x FROM (<subquery>) AS q(x))`
+#
+# `<var> <comp> ALL(<subquery>)`
+#    ==> `NOT Any(SELECT NOT(<var> <comp> x) FROM (<subquery>) AS q(x))`
+# - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
+#
+# The Input field contains the subquery itself, which should be wrapped in a
+# Max1Row operator to enforce that the subquery can return at most one row
+# (Max1Row may be removed by the optimizer later if it can determine statically
+# that the subquery will always return at most one row). The Projection field
+# contains a single column representing the output of the subquery. For
+# example, `(SELECT 1, 'a')` would be represented by the following structure:
+#
+# (Subquery
+#   (Max1Row
+#     (Project (Values (Tuple)) (Projections (Tuple (Const 1) (Const 'a'))))
+#   )
+#   (Variable 3)
+# )
+#
+# Here Variable 3 refers to the projection from the Input,
+# (Tuple (Const 1) (Const 'a')).
+[Scalar]
+define Subquery {
+    Input      Expr
+    Projection Expr
+}
+
+# Any is a special operator that does not exist in SQL. However, it is very
+# similar to the SQL ANY, and can be converted to the SQL ANY operator using
+# the following transformation:
+#  `Any(<subquery>)` ==> `True = ANY(<subquery>)`
+#
+# Any expects the subquery to return a single boolean column. The semantics
+# are equivalent to the SQL ANY expression above on the right: Any returns true
+# if any of the values returned by the subquery are true, else returns NULL
+# if any of the values are NULL, else returns false.
+[Scalar]
+define Any {
+    Input Expr
+}
+
+# Variable is the typed scalar value of a column in the query. The private
+# field is a Metadata.ColumnID that references the column by index.
+[Scalar]
+define Variable {
+    Col ColumnID
+}
+
+# Const is a typed scalar constant value. The private field is a tree.Datum
+# value having any datum type that's legal in the expression's context.
+[Scalar, ConstValue]
+define Const {
+    Value Datum
+}
+
+# Null is the constant SQL null value that has "unknown value" semantics. If
+# the Typ field is not types.Unknown, then the value is known to be in the
+# domain of that type. This is important for preserving correct types in
+# replacement patterns. For example:
+#   (Plus (Function ...) (Const 1))
+#
+# If the function in that expression has a static type of Int, but then it gets
+# constant folded to (Null), then its type must remain as Int. Any other type
+# violates logical equivalence of the expression, breaking type inference and
+# possibly changing the results of execution. The solution is to tag the null
+# with the correct type:
+#   (Plus (Null (Int)) (Const 1))
+#
+# Null is its own operator rather than a Const datum in order to make matching
+# and replacement easier and more efficient, as patterns can contain (Null)
+# expressions.
+[Scalar, ConstValue]
+define Null {
+    Typ Type
+}
+
+# True is the boolean true value that is equivalent to the tree.DBoolTrue datum
+# value. It is a separate operator to make matching and replacement simpler and
+# more efficient, as patterns can contain (True) expressions.
+[Scalar, Boolean, ConstValue]
+define True {
+}
+
+# False is the boolean false value that is equivalent to the tree.DBoolFalse
+# datum value. It is a separate operator to make matching and replacement
+# simpler and more efficient, as patterns can contain (False) expressions.
+[Scalar, Boolean, ConstValue]
+define False {
+}
+
+[Scalar]
+define Placeholder {
+    Value TypedExpr
+}
+
+[Scalar]
+define Tuple {
+    Elems ExprList
+}
+
+# Projections is a set of typed scalar expressions that will become output
+# columns for a containing Project operator. The private Cols field contains
+# the list of column indexes returned by the expression, as an opt.ColList. It
+# is not legal for Cols to be empty.
+[Scalar]
+define Projections {
+    Elems ExprList
+    Cols  ColList
+}
+
+# Aggregations is a set of aggregate expressions that will become output
+# columns for a containing GroupBy operator. The private Cols field contains
+# the list of column indexes returned by the expression, as an opt.ColList. It
+# is legal for Cols to be empty.
+[Scalar]
+define Aggregations {
+    Aggs ExprList
+    Cols ColList
+}
+
+[Scalar]
+define Exists {
+    Input Expr
+}
+
+# Filters is a boolean And operator that only appears as the Filters child of
+# a Select operator, or the On child of a Join operator. For example:
+#   (Select
+#     (Scan a)
+#     (Filters (Gt (Variable a) 1) (Lt (Variable a) 5))
+#   )
+#
+# Normalization rules ensure that a Filters expression is always created if
+# there is at least one condition, so that other rules can rely on its presence
+# when matching, even in the case where there is only one condition. The
+# semantics of the Filters operator are identical to those of the And operator.
+[Scalar, Boolean]
+define Filters {
+    Conditions ExprList
+}
+
+# And is the boolean conjunction operator that evalutes to true if all of its
+# conditions evaluate to true. If the conditions list is empty, it evalutes to
+# true.
+[Scalar, Boolean]
+define And {
+    Conditions ExprList
+}
+
+# Or is the boolean disjunction operator that evalutes to true if any of its
+# conditions evaluate to true. If the conditions list is empty, it evaluates to
+# false.
+[Scalar, Boolean]
+define Or {
+    Conditions ExprList
+}
+
+# Not is the boolean negation operator that evaluates to true if its input
+# evalutes to false.
+[Scalar, Boolean]
+define Not {
+    Input Expr
+}
+
+[Scalar, Comparison]
+define Eq {
+   Left  Expr
+   Right Expr
+}
+
+[Scalar, Comparison]
+define Lt {
+   Left  Expr
+   Right Expr
+}
+
+[Scalar, Comparison]
+define Gt {
+   Left  Expr
+   Right Expr
+}
+
+[Scalar, Comparison]
+define Le {
+   Left  Expr
+   Right Expr
+}
+
+[Scalar, Comparison]
+define Ge {
+   Left  Expr
+   Right Expr
+}
+
+[Scalar, Comparison]
+define Ne {
+   Left  Expr
+   Right Expr
+}
+
+[Scalar, Comparison]
+define In {
+   Left  Expr
+   Right Expr
+}
+
+[Scalar, Comparison]
+define NotIn {
+   Left  Expr
+   Right Expr
+}
+
+[Scalar, Comparison]
+define Like {
+   Left  Expr
+   Right Expr
+}
+
+[Scalar, Comparison]
+define NotLike {
+   Left  Expr
+   Right Expr
+}
+
+[Scalar, Comparison]
+define ILike {
+   Left  Expr
+   Right Expr
+}
+
+[Scalar, Comparison]
+define NotILike {
+   Left  Expr
+   Right Expr
+}
+
+[Scalar, Comparison]
+define SimilarTo {
+   Left  Expr
+   Right Expr
+}
+
+[Scalar, Comparison]
+define NotSimilarTo {
+   Left  Expr
+   Right Expr
+}
+
+[Scalar, Comparison]
+define RegMatch {
+   Left  Expr
+   Right Expr
+}
+
+[Scalar, Comparison]
+define NotRegMatch {
+   Left  Expr
+   Right Expr
+}
+
+[Scalar, Comparison]
+define RegIMatch {
+   Left  Expr
+   Right Expr
+}
+
+[Scalar, Comparison]
+define NotRegIMatch {
+   Left  Expr
+   Right Expr
+}
+
+[Scalar, Comparison]
+define Is {
+   Left  Expr
+   Right Expr
+}
+
+[Scalar, Comparison]
+define IsNot {
+   Left  Expr
+   Right Expr
+}
+
+[Scalar, Comparison]
+define Contains {
+   Left  Expr
+   Right Expr
+}
+
+[Scalar, Comparison]
+define JsonExists {
+   Left  Expr
+   Right Expr
+}
+
+[Scalar, Comparison]
+define JsonAllExists {
+   Left  Expr
+   Right Expr
+}
+
+[Scalar, Comparison]
+define JsonSomeExists {
+   Left  Expr
+   Right Expr
+}
+
+[Scalar, Binary]
+define Bitand {
+   Left  Expr
+   Right Expr
+}
+
+[Scalar, Binary]
+define Bitor {
+   Left  Expr
+   Right Expr
+}
+
+[Scalar, Binary]
+define Bitxor {
+   Left  Expr
+   Right Expr
+}
+
+[Scalar, Binary]
+define Plus {
+   Left  Expr
+   Right Expr
+}
+
+[Scalar, Binary]
+define Minus {
+   Left  Expr
+   Right Expr
+}
+
+[Scalar, Binary]
+define Mult {
+   Left  Expr
+   Right Expr
+}
+
+[Scalar, Binary]
+define Div {
+   Left  Expr
+   Right Expr
+}
+
+[Scalar, Binary]
+define FloorDiv {
+   Left  Expr
+   Right Expr
+}
+
+[Scalar, Binary]
+define Mod {
+   Left  Expr
+   Right Expr
+}
+
+[Scalar, Binary]
+define Pow {
+   Left  Expr
+   Right Expr
+}
+
+[Scalar, Binary]
+define Concat {
+   Left  Expr
+   Right Expr
+}
+
+[Scalar, Binary]
+define LShift {
+   Left  Expr
+   Right Expr
+}
+
+[Scalar, Binary]
+define RShift {
+   Left  Expr
+   Right Expr
+}
+
+[Scalar, Binary]
+define FetchVal {
+   Json  Expr
+   Index Expr
+}
+
+[Scalar, Binary]
+define FetchText {
+   Json  Expr
+   Index Expr
+}
+
+[Scalar, Binary]
+define FetchValPath {
+   Json Expr
+   Path Expr
+}
+
+[Scalar, Binary]
+define FetchTextPath {
+   Json Expr
+   Path Expr
+}
+
+[Scalar, Unary]
+define UnaryMinus {
+    Input Expr
+}
+
+[Scalar, Unary]
+define UnaryComplement {
+    Input Expr
+}
+
+[Scalar]
+define Cast {
+    Input Expr
+    Typ   Type
+}
+
+# Case is a CASE statement of the form:
+#   CASE [ <Input> ]
+#       WHEN <condval1> THEN <expr1>
+#     [ WHEN <condval2> THEN <expr2> ] ...
+#     [ ELSE <expr> ]
+#   END
+#
+# The Case operator evaluates <Input> (if not provided, Input is set to True),
+# then picks the WHEN branch where <condval> is equal to
+# <Input>, then evaluates and returns the corresponding THEN expression. If no
+# WHEN branch matches, the ELSE expression is evaluated and returned, if any.
+# Otherwise, NULL is returned.
+#
+# Note that the Whens list inside Case is used to represent all the WHEN
+# branches as well as the ELSE statement if it exists. It is of the form:
+# [(When <condval1> <expr1>),(When <condval2> <expr2>),...,<expr>]
+[Scalar]
+define Case {
+    Input Expr
+    Whens ExprList
+}
+
+# When represents a single WHEN ... THEN ... condition inside a CASE statement.
+# It is the type of each list item in Whens (except for the last item which is
+# a raw expression for the ELSE statement).
+[Scalar]
+define When {
+    Condition Expr
+    Value     Expr
+}
+
+# Array is an ARRAY literal of the form ARRAY[<expr1>, <expr2>, ..., <exprN>].
+[Scalar]
+define Array {
+    Elems ExprList
+    Typ   Type
+}
+
+# Function invokes a builtin SQL function like CONCAT or NOW, passing the given
+# arguments. The private field is a *opt.FuncOpDef struct that provides the
+# name of the function as well as a pointer to the builtin overload definition.
+[Scalar]
+define Function {
+    Args ExprList
+    Def  FuncOpDef
+}
+
+[Scalar]
+define Coalesce {
+    Args ExprList
+}
+
+# UnsupportedExpr is used for interfacing with the old planner code. It can
+# encapsulate a TypedExpr that is otherwise not supported by the optimizer.
+[Scalar]
+define UnsupportedExpr {
+  Value TypedExpr
+}

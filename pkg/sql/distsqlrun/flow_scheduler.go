@@ -11,13 +11,12 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
 // implied. See the License for the specific language governing
 // permissions and limitations under the License.
-//
-// Author: Radu Berinde (radu@cockroachlabs.com)
 
 package distsqlrun
 
 import (
 	"container/list"
+	"context"
 
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/stop"
@@ -34,6 +33,7 @@ type flowScheduler struct {
 	log.AmbientContext
 	stopper    *stop.Stopper
 	flowDoneCh chan *Flow
+	metrics    *DistSQLMetrics
 
 	mu struct {
 		syncutil.Mutex
@@ -42,11 +42,22 @@ type flowScheduler struct {
 	}
 }
 
-func newFlowScheduler(ambient log.AmbientContext, stopper *stop.Stopper) *flowScheduler {
+// flowWithCtx stores a flow to run and a context to run it with.
+// TODO(asubiotto): Figure out if asynchronous flow execution can be rearranged
+// to avoid the need to store the context.
+type flowWithCtx struct {
+	ctx  context.Context
+	flow *Flow
+}
+
+func newFlowScheduler(
+	ambient log.AmbientContext, stopper *stop.Stopper, metrics *DistSQLMetrics,
+) *flowScheduler {
 	fs := &flowScheduler{
 		AmbientContext: ambient,
 		stopper:        stopper,
 		flowDoneCh:     make(chan *Flow, flowDoneChanSize),
+		metrics:        metrics,
 	}
 	fs.mu.queue = list.New()
 	return fs
@@ -59,35 +70,48 @@ func (fs *flowScheduler) canRunFlow(_ *Flow) bool {
 }
 
 // runFlowNow starts the given flow; does not wait for the flow to complete.
-func (fs *flowScheduler) runFlowNow(f *Flow) {
+func (fs *flowScheduler) runFlowNow(ctx context.Context, f *Flow) error {
 	fs.mu.numRunning++
-	f.Start(func() { fs.flowDoneCh <- f })
+	fs.metrics.FlowStart()
+	if err := f.Start(ctx, func() { fs.flowDoneCh <- f }); err != nil {
+		return err
+	}
 	// TODO(radu): we could replace the WaitGroup with a structure that keeps a
 	// refcount and automatically runs Cleanup() when the count reaches 0.
 	go func() {
 		f.Wait()
-		f.Cleanup()
+		f.Cleanup(ctx)
 	}()
+	return nil
 }
 
 // ScheduleFlow is the main interface of the flow scheduler: it runs or enqueues
 // the given flow.
-func (fs *flowScheduler) ScheduleFlow(f *Flow) error {
-	return fs.stopper.RunTask(func() {
-		fs.mu.Lock()
-		defer fs.mu.Unlock()
+//
+// If the flow can start immediately, errors encountered when starting the flow
+// are returned. If the flow is enqueued, these error will be later ignored.
+func (fs *flowScheduler) ScheduleFlow(ctx context.Context, f *Flow) error {
+	return fs.stopper.RunTaskWithErr(
+		ctx, "distsqlrun.flowScheduler: scheduling flow", func(ctx context.Context) error {
+			fs.mu.Lock()
+			defer fs.mu.Unlock()
 
-		if fs.canRunFlow(f) {
-			fs.runFlowNow(f)
-		} else {
-			fs.mu.queue.PushBack(f)
-		}
-	})
+			if fs.canRunFlow(f) {
+				return fs.runFlowNow(ctx, f)
+			}
+			fs.mu.queue.PushBack(&flowWithCtx{
+				ctx:  ctx,
+				flow: f,
+			})
+			return nil
+
+		})
 }
 
 // Start launches the main loop of the scheduler.
 func (fs *flowScheduler) Start() {
-	fs.stopper.RunWorker(func() {
+	ctx := fs.AnnotateCtx(context.Background())
+	fs.stopper.RunWorker(ctx, func(context.Context) {
 		stopped := false
 		fs.mu.Lock()
 		defer fs.mu.Unlock()
@@ -102,11 +126,17 @@ func (fs *flowScheduler) Start() {
 			case <-fs.flowDoneCh:
 				fs.mu.Lock()
 				fs.mu.numRunning--
+				fs.metrics.FlowStop()
 				if !stopped {
 					if frElem := fs.mu.queue.Front(); frElem != nil {
-						f := frElem.Value.(*Flow)
+						n := frElem.Value.(*flowWithCtx)
 						fs.mu.queue.Remove(frElem)
-						fs.runFlowNow(f)
+						// Note: we use the flow's context instead of the worker
+						// context, to ensure that logging etc is relative to the
+						// specific flow.
+						if err := fs.runFlowNow(n.ctx, n.flow); err != nil {
+							log.Errorf(n.ctx, "error starting queued flow: %s", err)
+						}
 					}
 				}
 

@@ -11,26 +11,25 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
 // implied. See the License for the specific language governing
 // permissions and limitations under the License.
-//
-// Author: Marc Berhault (marc@cockroachlabs.com)
 
 package base
 
 import (
+	"context"
 	"crypto/tls"
-	"fmt"
 	"net/http"
 	"net/url"
-	"os"
-	"path/filepath"
 	"sync"
 	"time"
 
 	"github.com/pkg/errors"
 
-	"github.com/cockroachdb/cockroach/pkg/cli/cliflags"
 	"github.com/cockroachdb/cockroach/pkg/security"
+	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
+	"github.com/cockroachdb/cockroach/pkg/util/envutil"
+	"github.com/cockroachdb/cockroach/pkg/util/mon"
 	"github.com/cockroachdb/cockroach/pkg/util/retry"
+	"github.com/cockroachdb/cockroach/pkg/util/stop"
 )
 
 // Base config defaults.
@@ -54,20 +53,58 @@ const (
 	// NetworkTimeout is the timeout used for network operations.
 	NetworkTimeout = 3 * time.Second
 
-	// DefaultRaftTickInterval is the default resolution of the Raft timer.
-	DefaultRaftTickInterval = 200 * time.Millisecond
+	// DefaultCertsDirectory is the default value for the cert directory flag.
+	DefaultCertsDirectory = "${HOME}/.cockroach-certs"
+
+	// defaultRaftTickInterval is the default resolution of the Raft timer.
+	defaultRaftTickInterval = 200 * time.Millisecond
+
+	// defaultRangeLeaseRaftElectionTimeoutMultiplier specifies what multiple the
+	// leader lease active duration should be of the raft election timeout.
+	defaultRangeLeaseRaftElectionTimeoutMultiplier = 3
+
+	// rangeLeaseRenewalFraction specifies what fraction the range lease
+	// renewal duration should be of the range lease active time. For example,
+	// with a value of 0.2 and a lease duration of 10 seconds, leases would be
+	// eagerly renewed 2 seconds into each lease.
+	rangeLeaseRenewalFraction = 0.5
+
+	// livenessRenewalFraction specifies what fraction the node liveness
+	// renewal duration should be of the node liveness duration. For example,
+	// with a value of 0.2 and a liveness duration of 10 seconds, each node's
+	// liveness record would be eagerly renewed after 2 seconds.
+	livenessRenewalFraction = 0.5
+
+	// DefaultTableDescriptorLeaseDuration is the default mean duration a
+	// lease will be acquired for. The actual duration is jittered using
+	// the jitter fraction. Jittering is done to prevent multiple leases
+	// from being renewed simultaneously if they were all acquired
+	// simultaneously.
+	DefaultTableDescriptorLeaseDuration = 5 * time.Minute
+
+	// DefaultTableDescriptorLeaseJitterFraction is the default factor
+	// that we use to randomly jitter the lease duration when acquiring a
+	// new lease and the lease renewal timeout.
+	DefaultTableDescriptorLeaseJitterFraction = 0.25
+
+	// DefaultTableDescriptorLeaseRenewalTimeout is the default time
+	// before a lease expires when acquisition to renew the lease begins.
+	DefaultTableDescriptorLeaseRenewalTimeout = time.Minute
 )
 
-type lazyTLSConfig struct {
-	once      sync.Once
-	tlsConfig *tls.Config
-	err       error
-}
+var defaultRaftElectionTimeoutTicks = envutil.EnvOrDefaultInt(
+	"COCKROACH_RAFT_ELECTION_TIMEOUT_TICKS", 15)
 
 type lazyHTTPClient struct {
 	once       sync.Once
 	httpClient http.Client
 	err        error
+}
+
+type lazyCertificateManager struct {
+	once sync.Once
+	cm   *security.CertificateManager
+	err  error
 }
 
 // Config is embedded by server.Config. A base config is not meant to be used
@@ -77,11 +114,10 @@ type Config struct {
 	// This is really not recommended.
 	Insecure bool
 
-	// SSLCA and others contain the paths to the ssl certificates and keys.
-	SSLCA      string // CA certificate
-	SSLCAKey   string // CA key (to sign only)
-	SSLCert    string // Client/server certificate
-	SSLCertKey string // Client/server key
+	// SSLCAKey is used to sign new certs.
+	SSLCAKey string
+	// SSLCertsDir is the path to the certificate/key directory.
+	SSLCertsDir string
 
 	// User running this process. It could be the user under which
 	// the server is running or the user passed in client calls.
@@ -103,23 +139,33 @@ type Config struct {
 	// See https://github.com/grpc/grpc-go/issues/586.
 	HTTPAddr string
 
-	// clientTLSConfig is the loaded client TLS config. It is initialized lazily.
-	clientTLSConfig lazyTLSConfig
-
-	// serverTLSConfig is the loaded server TLS config. It is initialized lazily.
-	serverTLSConfig lazyTLSConfig
+	// The certificate manager. Must be accessed through GetCertificateManager.
+	certificateManager lazyCertificateManager
 
 	// httpClient uses the client TLS config. It is initialized lazily.
 	httpClient lazyHTTPClient
+
+	// HistogramWindowInterval is used to determine the approximate length of time
+	// that individual samples are retained in in-memory histograms. Currently,
+	// it is set to the arbitrary length of six times the Metrics sample interval.
+	// See the comment in server.Config for more details.
+	HistogramWindowInterval time.Duration
+}
+
+func didYouMeanInsecureError(err error) error {
+	return errors.Wrap(err, "problem using security settings, did you mean to use --insecure?")
 }
 
 // InitDefaults sets up the default values for a config.
+// This is also used in tests to reset global objects.
 func (cfg *Config) InitDefaults() {
 	cfg.Insecure = defaultInsecure
 	cfg.User = defaultUser
 	cfg.Addr = defaultAddr
 	cfg.AdvertiseAddr = cfg.Addr
 	cfg.HTTPAddr = defaultHTTPAddr
+	cfg.SSLCertsDir = DefaultCertsDirectory
+	cfg.certificateManager = lazyCertificateManager{}
 }
 
 // HTTPRequestScheme returns "http" or "https" based on the value of Insecure.
@@ -131,63 +177,62 @@ func (cfg *Config) HTTPRequestScheme() string {
 }
 
 // AdminURL returns the URL for the admin UI.
-func (cfg *Config) AdminURL() string {
-	return fmt.Sprintf("%s://%s", cfg.HTTPRequestScheme(), cfg.HTTPAddr)
+func (cfg *Config) AdminURL() *url.URL {
+	return &url.URL{
+		Scheme: cfg.HTTPRequestScheme(),
+		Host:   cfg.HTTPAddr,
+	}
 }
 
-// PGURL returns the URL for the postgres endpoint.
-func (cfg *Config) PGURL(user *url.Userinfo) (*url.URL, error) {
-	// Try to convert path to an absolute path. Failing to do so return path
-	// unchanged.
-	absPath := func(path string) string {
-		r, err := filepath.Abs(path)
-		if err != nil {
-			return path
-		}
-		return r
+// GetClientCertPaths returns the paths to the client cert and key.
+func (cfg *Config) GetClientCertPaths(user string) (string, string, error) {
+	cm, err := cfg.GetCertificateManager()
+	if err != nil {
+		return "", "", err
 	}
+	return cm.GetClientCertPaths(user)
+}
 
-	options := url.Values{}
+// GetCACertPath returns the path to the CA certificate.
+func (cfg *Config) GetCACertPath() (string, error) {
+	cm, err := cfg.GetCertificateManager()
+	if err != nil {
+		return "", err
+	}
+	return cm.GetCACertPath()
+}
+
+// LoadSecurityOptions extends a url.Values with SSL settings suitable for
+// the given server config. It returns true if and only if the URL
+// already contained SSL config options.
+func (cfg *Config) LoadSecurityOptions(options url.Values, username string) error {
 	if cfg.Insecure {
 		options.Add("sslmode", "disable")
 	} else {
-		if cfg.SSLCA == "" {
-			return nil, fmt.Errorf("missing --%s flag", cliflags.CACert.Name)
+		// Fetch CA cert. This is required.
+		caCertPath, err := cfg.GetCACertPath()
+		if err != nil {
+			return didYouMeanInsecureError(err)
 		}
-
-		// Check that cfg.SSLCert and cfg.SSLCertKey are either both empty or
-		// both non-empty.
-		// If both are provided, the server will authenticate the client using
-		// certificate authentication. If not, password authentication will be
-		// used.
-		if cfg.SSLCert == "" && cfg.SSLCertKey != "" {
-			return nil, fmt.Errorf("missing --%s flag", cliflags.Cert.Name)
-		}
-		if cfg.SSLCertKey == "" && cfg.SSLCert != "" {
-			return nil, fmt.Errorf("missing --%s flag", cliflags.Key.Name)
-		}
-
 		options.Add("sslmode", "verify-full")
-		sslFlags := []struct {
-			name     string
-			value    string
-			flagName string
-		}{
-			{"sslcert", cfg.SSLCert, cliflags.Cert.Name},
-			{"sslkey", cfg.SSLCertKey, cliflags.Key.Name},
-			{"sslrootcert", cfg.SSLCA, cliflags.CACert.Name},
-		}
+		options.Add("sslrootcert", caCertPath)
 
-		for _, c := range sslFlags {
-			if c.value == "" {
-				continue
-			}
-			path := absPath(c.value)
-			if _, err := os.Stat(path); err != nil {
-				return nil, fmt.Errorf("file for --%s flag gave error: %v", c.flagName, err)
-			}
-			options.Add(c.name, path)
+		// Fetch certs, but don't fail, we may be using a password.
+		certPath, keyPath, err := cfg.GetClientCertPaths(username)
+		if err == nil {
+			options.Add("sslcert", certPath)
+			options.Add("sslkey", keyPath)
 		}
+	}
+	return nil
+}
+
+// PGURL constructs a URL for the postgres endpoint, given a server
+// config. There is no default database set.
+func (cfg *Config) PGURL(user *url.Userinfo) (*url.URL, error) {
+	options := url.Values{}
+	if err := cfg.LoadSecurityOptions(options, user.Username()); err != nil {
+		return nil, err
 	}
 	return &url.URL{
 		Scheme:   "postgresql",
@@ -197,63 +242,163 @@ func (cfg *Config) PGURL(user *url.Userinfo) (*url.URL, error) {
 	}, nil
 }
 
+// GetCertificateManager returns the certificate manager, initializing it
+// on the first call.
+func (cfg *Config) GetCertificateManager() (*security.CertificateManager, error) {
+	cfg.certificateManager.once.Do(func() {
+		cfg.certificateManager.cm, cfg.certificateManager.err =
+			security.NewCertificateManager(cfg.SSLCertsDir)
+	})
+	return cfg.certificateManager.cm, cfg.certificateManager.err
+}
+
+// InitializeNodeTLSConfigs tries to load client and server-side TLS configs.
+// It also enables the reload-on-SIGHUP functionality on the certificate manager.
+// This should be called early in the life of the server to make sure there are no
+// issues with TLS configs.
+// Returns the certificate manager if successfully created and in secure mode.
+func (cfg *Config) InitializeNodeTLSConfigs(
+	stopper *stop.Stopper,
+) (*security.CertificateManager, error) {
+	if cfg.Insecure {
+		return nil, nil
+	}
+
+	if _, err := cfg.GetServerTLSConfig(); err != nil {
+		return nil, err
+	}
+	if _, err := cfg.GetClientTLSConfig(); err != nil {
+		return nil, err
+	}
+
+	cm, err := cfg.GetCertificateManager()
+	if err != nil {
+		return nil, err
+	}
+	cm.RegisterSignalHandler(stopper)
+	return cm, nil
+}
+
 // GetClientTLSConfig returns the client TLS config, initializing it if needed.
-// If Insecure is true, return a nil config, otherwise load a config based
-// on the SSLCert file. If SSLCert is empty, use a very permissive config.
-// TODO(marc): empty SSLCert should fail when client certificates are required.
+// If Insecure is true, return a nil config, otherwise ask the certificate
+// manager for a TLS config using certs for the config.User.
 func (cfg *Config) GetClientTLSConfig() (*tls.Config, error) {
 	// Early out.
 	if cfg.Insecure {
 		return nil, nil
 	}
 
-	cfg.clientTLSConfig.once.Do(func() {
-		cfg.clientTLSConfig.tlsConfig, cfg.clientTLSConfig.err = security.LoadClientTLSConfig(
-			cfg.SSLCA, cfg.SSLCert, cfg.SSLCertKey)
-		if cfg.clientTLSConfig.err != nil {
-			cfg.clientTLSConfig.err = errors.Errorf("error setting up client TLS config: %s", cfg.clientTLSConfig.err)
-		}
-	})
+	cm, err := cfg.GetCertificateManager()
+	if err != nil {
+		return nil, didYouMeanInsecureError(err)
+	}
 
-	return cfg.clientTLSConfig.tlsConfig, cfg.clientTLSConfig.err
+	tlsCfg, err := cm.GetClientTLSConfig(cfg.User)
+	if err != nil {
+		return nil, didYouMeanInsecureError(err)
+	}
+	return tlsCfg, nil
 }
 
 // GetServerTLSConfig returns the server TLS config, initializing it if needed.
-// If Insecure is true, return a nil config, otherwise load a config based
-// on the SSLCert file. Fails if Insecure=false and SSLCert="".
+// If Insecure is true, return a nil config, otherwise ask the certificate
+// manager for a server TLS config.
 func (cfg *Config) GetServerTLSConfig() (*tls.Config, error) {
 	// Early out.
 	if cfg.Insecure {
 		return nil, nil
 	}
 
-	cfg.serverTLSConfig.once.Do(func() {
-		if cfg.SSLCert != "" {
-			cfg.serverTLSConfig.tlsConfig, cfg.serverTLSConfig.err = security.LoadServerTLSConfig(
-				cfg.SSLCA, cfg.SSLCert, cfg.SSLCertKey)
-			if cfg.serverTLSConfig.err != nil {
-				cfg.serverTLSConfig.err = errors.Errorf("error setting up server TLS config: %s", cfg.serverTLSConfig.err)
-			}
-		} else {
-			cfg.serverTLSConfig.err = errors.Errorf("--%s=false, but --%s is empty. Certificates must be specified.",
-				cliflags.Insecure.Name, cliflags.Cert.Name)
-		}
-	})
+	cm, err := cfg.GetCertificateManager()
+	if err != nil {
+		return nil, didYouMeanInsecureError(err)
+	}
 
-	return cfg.serverTLSConfig.tlsConfig, cfg.serverTLSConfig.err
+	tlsCfg, err := cm.GetServerTLSConfig()
+	if err != nil {
+		return nil, didYouMeanInsecureError(err)
+	}
+	return tlsCfg, nil
 }
 
 // GetHTTPClient returns the http client, initializing it
 // if needed. It uses the client TLS config.
 func (cfg *Config) GetHTTPClient() (http.Client, error) {
 	cfg.httpClient.once.Do(func() {
-		cfg.httpClient.httpClient.Timeout = NetworkTimeout
+		cfg.httpClient.httpClient.Timeout = 10 * time.Second
 		var transport http.Transport
 		cfg.httpClient.httpClient.Transport = &transport
 		transport.TLSClientConfig, cfg.httpClient.err = cfg.GetClientTLSConfig()
 	})
 
 	return cfg.httpClient.httpClient, cfg.httpClient.err
+}
+
+// RaftConfig holds raft tuning parameters.
+type RaftConfig struct {
+	// RaftTickInterval is the resolution of the Raft timer.
+	RaftTickInterval time.Duration
+
+	// RaftElectionTimeoutTicks is the number of raft ticks before the
+	// previous election expires. This value is inherited by individual stores
+	// unless overridden.
+	RaftElectionTimeoutTicks int
+
+	// RangeLeaseRaftElectionTimeoutMultiplier specifies what multiple the leader
+	// lease active duration should be of the raft election timeout.
+	RangeLeaseRaftElectionTimeoutMultiplier float64
+}
+
+// SetDefaults initializes unset fields.
+func (cfg *RaftConfig) SetDefaults() {
+	if cfg.RaftTickInterval == 0 {
+		cfg.RaftTickInterval = defaultRaftTickInterval
+	}
+	if cfg.RaftElectionTimeoutTicks == 0 {
+		cfg.RaftElectionTimeoutTicks = defaultRaftElectionTimeoutTicks
+	}
+	if cfg.RangeLeaseRaftElectionTimeoutMultiplier == 0 {
+		cfg.RangeLeaseRaftElectionTimeoutMultiplier = defaultRangeLeaseRaftElectionTimeoutMultiplier
+	}
+}
+
+// RaftElectionTimeout returns the raft election timeout, as computed from the
+// tick interval and number of election timeout ticks.
+func (cfg RaftConfig) RaftElectionTimeout() time.Duration {
+	return time.Duration(cfg.RaftElectionTimeoutTicks) * cfg.RaftTickInterval
+}
+
+// RangeLeaseDurations computes durations for range lease expiration and
+// renewal based on a default multiple of Raft election timeout.
+func (cfg RaftConfig) RangeLeaseDurations() (rangeLeaseActive, rangeLeaseRenewal time.Duration) {
+	rangeLeaseActive = time.Duration(cfg.RangeLeaseRaftElectionTimeoutMultiplier *
+		float64(cfg.RaftElectionTimeout()))
+	rangeLeaseRenewal = time.Duration(float64(rangeLeaseActive) * rangeLeaseRenewalFraction)
+	return
+}
+
+// RangeLeaseActiveDuration is the duration of the active period of leader
+// leases requested.
+func (cfg RaftConfig) RangeLeaseActiveDuration() time.Duration {
+	rangeLeaseActive, _ := cfg.RangeLeaseDurations()
+	return rangeLeaseActive
+}
+
+// RangeLeaseRenewalDuration specifies a time interval at the end of the
+// active lease interval (i.e. bounded to the right by the start of the stasis
+// period) during which operations will trigger an asynchronous renewal of the
+// lease.
+func (cfg RaftConfig) RangeLeaseRenewalDuration() time.Duration {
+	_, rangeLeaseRenewal := cfg.RangeLeaseDurations()
+	return rangeLeaseRenewal
+}
+
+// NodeLivenessDurations computes durations for node liveness expiration and
+// renewal based on a default multiple of Raft election timeout.
+func (cfg RaftConfig) NodeLivenessDurations() (livenessActive, livenessRenewal time.Duration) {
+	livenessActive = cfg.RangeLeaseActiveDuration()
+	livenessRenewal = time.Duration(float64(livenessActive) * livenessRenewalFraction)
+	return
 }
 
 // DefaultRetryOptions should be used for retrying most
@@ -264,7 +409,100 @@ func DefaultRetryOptions() retry.Options {
 	// estimate of latency.
 	return retry.Options{
 		InitialBackoff: 50 * time.Millisecond,
-		MaxBackoff:     5 * time.Second,
+		MaxBackoff:     1 * time.Second,
 		Multiplier:     2,
+	}
+}
+
+const (
+	// DefaultTempStorageMaxSizeBytes is the default maximum budget
+	// for temp storage.
+	DefaultTempStorageMaxSizeBytes = 32 * 1024 * 1024 * 1024 /* 32GB */
+	// DefaultInMemTempStorageMaxSizeBytes is the default maximum budget
+	// for in-memory temp storages.
+	DefaultInMemTempStorageMaxSizeBytes = 100 * 1024 * 1024 /* 100MB */
+)
+
+// TempStorageConfig contains the details that can be specified in the cli
+// pertaining to temp storage flags, specifically --temp-dir and
+// --max-disk-temp-storage.
+type TempStorageConfig struct {
+	// InMemory specifies whether the temporary storage will remain
+	// in-memory or occupy a temporary subdirectory on-disk.
+	InMemory bool
+	// Path is the filepath of the temporary subdirectory created for
+	// the temp storage.
+	Path string
+	// Mon will be used by the temp storage to register all its capacity requests.
+	// It can be used to limit the disk or memory that temp storage is allowed to
+	// use. If InMemory is set, than this has to be a memory monitor; otherwise it
+	// has to be a disk monitor.
+	Mon *mon.BytesMonitor
+}
+
+// TempStorageConfigFromEnv creates a TempStorageConfig.
+// If parentDir is not specified and the specified store is in-memory,
+// then the temp storage will also be in-memory.
+func TempStorageConfigFromEnv(
+	ctx context.Context,
+	st *cluster.Settings,
+	firstStore StoreSpec,
+	parentDir string,
+	maxSizeBytes int64,
+) TempStorageConfig {
+	inMem := parentDir == "" && firstStore.InMemory
+	var monitor mon.BytesMonitor
+	if inMem {
+		monitor = mon.MakeMonitor(
+			"in-mem temp storage",
+			mon.MemoryResource,
+			nil,             /* curCount */
+			nil,             /* maxHist */
+			1024*1024,       /* increment */
+			maxSizeBytes/10, /* noteworthy */
+			st,
+		)
+		monitor.Start(ctx, nil /* pool */, mon.MakeStandaloneBudget(maxSizeBytes))
+	} else {
+		monitor = mon.MakeMonitor(
+			"temp disk storage",
+			mon.DiskResource,
+			nil,             /* curCount */
+			nil,             /* maxHist */
+			64*1024*1024,    /* increment */
+			maxSizeBytes/10, /* noteworthy */
+			st,
+		)
+		monitor.Start(ctx, nil /* pool */, mon.MakeStandaloneBudget(maxSizeBytes))
+	}
+
+	return TempStorageConfig{
+		InMemory: inMem,
+		Mon:      &monitor,
+	}
+}
+
+// LeaseManagerConfig holds table lease manager parameters.
+type LeaseManagerConfig struct {
+	// TableDescriptorLeaseDuration is the mean duration a lease will be
+	// acquired for.
+	TableDescriptorLeaseDuration time.Duration
+
+	// TableDescriptorLeaseJitterFraction is the factor that we use to
+	// randomly jitter the lease duration when acquiring a new lease and
+	// the lease renewal timeout.
+	TableDescriptorLeaseJitterFraction float64
+
+	// DefaultTableDescriptorLeaseRenewalTimeout is the default time
+	// before a lease expires when acquisition to renew the lease begins.
+	TableDescriptorLeaseRenewalTimeout time.Duration
+}
+
+// NewLeaseManagerConfig initializes a LeaseManagerConfig with default values.
+func NewLeaseManagerConfig() *LeaseManagerConfig {
+	return &LeaseManagerConfig{
+		TableDescriptorLeaseDuration:       DefaultTableDescriptorLeaseDuration,
+		TableDescriptorLeaseJitterFraction: DefaultTableDescriptorLeaseJitterFraction,
+		TableDescriptorLeaseRenewalTimeout: DefaultTableDescriptorLeaseRenewalTimeout,
 	}
 }

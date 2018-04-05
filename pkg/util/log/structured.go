@@ -11,18 +11,16 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
 // implied. See the License for the specific language governing
 // permissions and limitations under the License.
-//
-// Author: Spencer Kimball (spencer.kimball@gmail.com)
 
 package log
 
 import (
 	"bytes"
+	"context"
 	"fmt"
 	"strconv"
 
-	"golang.org/x/net/context"
-
+	"github.com/cockroachdb/cockroach/pkg/settings"
 	"github.com/cockroachdb/cockroach/pkg/util/caller"
 	otlog "github.com/opentracing/opentracing-go/log"
 )
@@ -123,11 +121,13 @@ func formatTags(ctx context.Context, buf *msgBuf) bool {
 	return false
 }
 
-// makeMessage creates a structured log entry.
-func makeMessage(ctx context.Context, format string, args []interface{}) string {
+// MakeMessage creates a structured log entry.
+func MakeMessage(ctx context.Context, format string, args []interface{}) string {
 	var buf msgBuf
 	formatTags(ctx, &buf)
-	if len(format) == 0 {
+	if len(args) == 0 {
+		buf.WriteString(format)
+	} else if len(format) == 0 {
 		fmt.Fprint(&buf, args...)
 	} else {
 		fmt.Fprintf(&buf, format, args...)
@@ -139,8 +139,16 @@ func makeMessage(ctx context.Context, format string, args []interface{}) string 
 // specified facility of the logger.
 func addStructured(ctx context.Context, s Severity, depth int, format string, args []interface{}) {
 	file, line, _ := caller.Lookup(depth + 1)
-	msg := makeMessage(ctx, format, args)
-	// makeMessage already added the tags when forming msg, we don't want
+	msg := MakeMessage(ctx, format, args)
+
+	if s == Severity_FATAL {
+		// We load the ReportingSettings from the a global singleton in this
+		// call path. See the singleton's comment for a rationale.
+		if sv := settings.TODO(); sv != nil {
+			SendCrashReport(ctx, sv, depth+2, format, args)
+		}
+	}
+	// MakeMessage already added the tags when forming msg, we don't want
 	// eventInternal to prepend them again.
 	eventInternal(ctx, (s >= Severity_ERROR), false /*withTags*/, "%s:%d %s", file, line, msg)
 	logging.outputLogEntry(s, file, line, msg)

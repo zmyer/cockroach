@@ -11,30 +11,34 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
 // implied. See the License for the specific language governing
 // permissions and limitations under the License.
-//
-// Author: Matt Tracy (matt@cockroachlabs.com)
 
 package acceptance
 
 import (
+	"context"
 	gosql "database/sql"
 	"encoding/json"
 	"testing"
 
 	"github.com/pkg/errors"
-	"golang.org/x/net/context"
 
 	"github.com/cockroachdb/cockroach/pkg/acceptance/cluster"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	csql "github.com/cockroachdb/cockroach/pkg/sql"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
+	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/uuid"
 )
 
 // TestEventLog verifies that "node joined" and "node restart" events are
 // recorded whenever a node starts and contacts the cluster.
 func TestEventLog(t *testing.T) {
-	runTestOnConfigs(t, testEventLogInner)
+	s := log.Scope(t)
+	defer s.Close(t)
+
+	RunLocal(t, func(t *testing.T) {
+		runTestWithCluster(t, testEventLogInner)
+	})
 }
 
 func testEventLogInner(
@@ -61,7 +65,7 @@ func testEventLogInner(
 		// Query all node join events. There should be one for each node in the
 		// cluster.
 		rows, err := db.Query(
-			"SELECT targetID, info FROM system.eventlog WHERE eventType = $1",
+			`SELECT "targetID", info FROM system.eventlog WHERE "eventType" = $1`,
 			string(csql.EventLogNodeJoin))
 		if err != nil {
 			return err
@@ -131,7 +135,7 @@ func testEventLogInner(
 
 		// Query all node restart events. There should only be one.
 		rows, err := db.Query(
-			"SELECT targetID, info FROM system.eventlog WHERE eventType = $1",
+			`SELECT "targetID", info FROM system.eventlog WHERE "eventType" = $1`,
 			string(csql.EventLogNodeRestart))
 		if err != nil {
 			return err

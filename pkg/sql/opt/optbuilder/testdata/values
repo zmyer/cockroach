@@ -1,0 +1,204 @@
+# tests adapted from logictest -- values
+
+build
+VALUES (1)
+----
+values
+ ├── columns: column1:1(int)
+ └── tuple [type=tuple{int}]
+      └── const: 1 [type=int]
+
+build
+VALUES (1, 2, 3), (4, 5, 6)
+----
+values
+ ├── columns: column1:1(int) column2:2(int) column3:3(int)
+ ├── tuple [type=tuple{int, int, int}]
+ │    ├── const: 1 [type=int]
+ │    ├── const: 2 [type=int]
+ │    └── const: 3 [type=int]
+ └── tuple [type=tuple{int, int, int}]
+      ├── const: 4 [type=int]
+      ├── const: 5 [type=int]
+      └── const: 6 [type=int]
+
+build
+VALUES (1), (2, 3)
+----
+error: VALUES lists must all be the same length, expected 1 columns, found 2
+
+build
+VALUES (1), (1), (2), (3) ORDER BY 1 DESC LIMIT 3
+----
+limit
+ ├── columns: column1:1(int)
+ ├── ordering: -1
+ ├── sort
+ │    ├── columns: column1:1(int)
+ │    ├── ordering: -1
+ │    └── values
+ │         ├── columns: column1:1(int)
+ │         ├── tuple [type=tuple{int}]
+ │         │    └── const: 1 [type=int]
+ │         ├── tuple [type=tuple{int}]
+ │         │    └── const: 1 [type=int]
+ │         ├── tuple [type=tuple{int}]
+ │         │    └── const: 2 [type=int]
+ │         └── tuple [type=tuple{int}]
+ │              └── const: 3 [type=int]
+ └── const: 3 [type=int]
+
+# TODO(rytaft): Error message should be `pgcode 42703 column "z" does not exist`
+build
+VALUES (1), (1), (2), (3) ORDER BY z
+----
+error: column name "z" not found
+
+build
+VALUES ('this', 'is', 'a', 'test'), (1, 2, 3, 4)
+----
+error: VALUES list type mismatch, int for string
+
+build
+VALUES ('one', 1, 1.0), ('two', 2, 2.0)
+----
+values
+ ├── columns: column1:1(string) column2:2(int) column3:3(decimal)
+ ├── tuple [type=tuple{string, int, decimal}]
+ │    ├── const: 'one' [type=string]
+ │    ├── const: 1 [type=int]
+ │    └── const: 1.0 [type=decimal]
+ └── tuple [type=tuple{string, int, decimal}]
+      ├── const: 'two' [type=string]
+      ├── const: 2 [type=int]
+      └── const: 2.0 [type=decimal]
+
+build
+VALUES (true), (true), (false)
+----
+values
+ ├── columns: column1:1(bool)
+ ├── tuple [type=tuple{bool}]
+ │    └── true [type=bool]
+ ├── tuple [type=tuple{bool}]
+ │    └── true [type=bool]
+ └── tuple [type=tuple{bool}]
+      └── false [type=bool]
+
+build
+VALUES (NULL)
+----
+values
+ ├── columns: column1:1(unknown)
+ └── tuple [type=tuple{unknown}]
+      └── null [type=unknown]
+
+build
+VALUES (NULL, 1)
+----
+values
+ ├── columns: column1:1(unknown) column2:2(int)
+ └── tuple [type=tuple{unknown, int}]
+      ├── null [type=unknown]
+      └── const: 1 [type=int]
+
+build
+VALUES (NULL, 1), (2, NULL)
+----
+values
+ ├── columns: column1:1(int) column2:2(int)
+ ├── tuple [type=tuple{unknown, int}]
+ │    ├── null [type=unknown]
+ │    └── const: 1 [type=int]
+ └── tuple [type=tuple{int, unknown}]
+      ├── const: 2 [type=int]
+      └── null [type=unknown]
+
+build
+VALUES (NULL, 1), (2, NULL)
+----
+values
+ ├── columns: column1:1(int) column2:2(int)
+ ├── tuple [type=tuple{unknown, int}]
+ │    ├── null [type=unknown]
+ │    └── const: 1 [type=int]
+ └── tuple [type=tuple{int, unknown}]
+      ├── const: 2 [type=int]
+      └── null [type=unknown]
+
+build
+VALUES (NULL, 1), (2, NULL), (NULL, 'a')
+----
+error: VALUES list type mismatch, string for int
+
+build
+SELECT COALESCE(a, b) FROM (VALUES (1, 2), (3, NULL), (NULL, 4), (NULL, NULL)) AS v(a, b)
+----
+project
+ ├── columns: column3:3(int)
+ ├── values
+ │    ├── columns: column1:1(int) column2:2(int)
+ │    ├── tuple [type=tuple{int, int}]
+ │    │    ├── const: 1 [type=int]
+ │    │    └── const: 2 [type=int]
+ │    ├── tuple [type=tuple{int, unknown}]
+ │    │    ├── const: 3 [type=int]
+ │    │    └── null [type=unknown]
+ │    ├── tuple [type=tuple{unknown, int}]
+ │    │    ├── null [type=unknown]
+ │    │    └── const: 4 [type=int]
+ │    └── tuple [type=tuple{unknown, unknown}]
+ │         ├── null [type=unknown]
+ │         └── null [type=unknown]
+ └── projections
+      └── coalesce [type=int]
+           ├── variable: column1 [type=int]
+           └── variable: column2 [type=int]
+
+# subqueries can be evaluated in VALUES
+build
+VALUES ((SELECT 1)), ((SELECT 2))
+----
+values
+ ├── columns: column1:3(int)
+ ├── tuple [type=tuple{int}]
+ │    └── subquery [type=int]
+ │         ├── max1-row
+ │         │    ├── columns: column1:1(int)
+ │         │    └── project
+ │         │         ├── columns: column1:1(int)
+ │         │         ├── values
+ │         │         │    └── tuple [type=tuple{}]
+ │         │         └── projections
+ │         │              └── const: 1 [type=int]
+ │         └── variable: column1 [type=int]
+ └── tuple [type=tuple{int}]
+      └── subquery [type=int]
+           ├── max1-row
+           │    ├── columns: column2:2(int)
+           │    └── project
+           │         ├── columns: column2:2(int)
+           │         ├── values
+           │         │    └── tuple [type=tuple{}]
+           │         └── projections
+           │              └── const: 2 [type=int]
+           └── variable: column2 [type=int]
+
+build
+VALUES (1), ((SELECT 2))
+----
+values
+ ├── columns: column1:2(int)
+ ├── tuple [type=tuple{int}]
+ │    └── const: 1 [type=int]
+ └── tuple [type=tuple{int}]
+      └── subquery [type=int]
+           ├── max1-row
+           │    ├── columns: column1:1(int)
+           │    └── project
+           │         ├── columns: column1:1(int)
+           │         ├── values
+           │         │    └── tuple [type=tuple{}]
+           │         └── projections
+           │              └── const: 2 [type=int]
+           └── variable: column1 [type=int]

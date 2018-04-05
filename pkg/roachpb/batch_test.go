@@ -11,15 +11,16 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
 // implied. See the License for the specific language governing
 // permissions and limitations under the License.
-//
-// Author: Spencer Kimball (spencer.kimball@gmail.com)
-// Author: Veteran Lu (23907238@qq.com)
 
 package roachpb
 
 import (
 	"reflect"
 	"testing"
+
+	"github.com/cockroachdb/cockroach/pkg/storage/engine/enginepb"
+	"github.com/cockroachdb/cockroach/pkg/util/hlc"
+	"github.com/kr/pretty"
 )
 
 func TestBatchSplit(t *testing.T) {
@@ -180,8 +181,8 @@ func TestIntentSpanIterate(t *testing.T) {
 	}
 
 	var spans []Span
-	fn := func(key, endKey Key) {
-		spans = append(spans, Span{Key: key, EndKey: endKey})
+	fn := func(span Span) {
+		spans = append(spans, span)
 	}
 	ba.IntentSpanIterate(&br, fn)
 	// Only DeleteRangeResponse is a write request.
@@ -210,5 +211,165 @@ func TestIntentSpanIterate(t *testing.T) {
 	}
 	if e := (Span{Key("g"), Key("h")}); !reflect.DeepEqual(e, spans[0]) {
 		t.Fatalf("unexpected spans: e = %+v, found = %+v", e, spans[0])
+	}
+}
+
+func TestRefreshSpanIterate(t *testing.T) {
+	testCases := []struct {
+		req    Request
+		resp   Response
+		span   Span
+		resume *Span
+	}{
+		{&ConditionalPutRequest{}, &ConditionalPutResponse{},
+			Span{Key: Key("a")}, nil},
+		{&PutRequest{}, &PutResponse{},
+			Span{Key: Key("a-put")}, nil},
+		{&InitPutRequest{}, &InitPutResponse{},
+			Span{Key: Key("a-initput")}, nil},
+		{&IncrementRequest{}, &IncrementResponse{},
+			Span{Key: Key("a-inc")}, nil},
+		{&ScanRequest{}, &ScanResponse{},
+			Span{Key("a"), Key("c")}, &Span{Key("b"), Key("c")}},
+		{&GetRequest{}, &GetResponse{},
+			Span{Key: Key("b")}, nil},
+		{&ReverseScanRequest{}, &ReverseScanResponse{},
+			Span{Key("d"), Key("f")}, &Span{Key("d"), Key("e")}},
+		{&DeleteRangeRequest{}, &DeleteRangeResponse{},
+			Span{Key("g"), Key("i")}, &Span{Key("h"), Key("i")}},
+	}
+
+	// A batch request with a batch response with no ResumeSpan.
+	ba := BatchRequest{}
+	br := BatchResponse{}
+	for _, tc := range testCases {
+		tc.req.SetHeader(tc.span)
+		ba.Add(tc.req)
+		br.Add(tc.resp)
+	}
+
+	var readSpans []Span
+	var writeSpans []Span
+	fn := func(span Span, write bool) {
+		if write {
+			writeSpans = append(writeSpans, span)
+		} else {
+			readSpans = append(readSpans, span)
+		}
+	}
+	ba.RefreshSpanIterate(&br, fn)
+	// Only the conditional put isn't considered a read span.
+	expReadSpans := []Span{testCases[2].span, testCases[4].span, testCases[5].span, testCases[6].span}
+	expWriteSpans := []Span{testCases[7].span}
+	if !reflect.DeepEqual(expReadSpans, readSpans) {
+		t.Fatalf("unexpected read spans: expected %+v, found = %+v", expReadSpans, readSpans)
+	}
+	if !reflect.DeepEqual(expWriteSpans, writeSpans) {
+		t.Fatalf("unexpected write spans: expected %+v, found = %+v", expWriteSpans, writeSpans)
+	}
+
+	// Batch responses with ResumeSpans.
+	ba = BatchRequest{}
+	br = BatchResponse{}
+	for _, tc := range testCases {
+		tc.req.SetHeader(tc.span)
+		ba.Add(tc.req)
+		if tc.resume != nil {
+			tc.resp.SetHeader(ResponseHeader{ResumeSpan: tc.resume})
+		}
+		br.Add(tc.resp)
+	}
+
+	readSpans = []Span{}
+	writeSpans = []Span{}
+	ba.RefreshSpanIterate(&br, fn)
+	expReadSpans = []Span{
+		{Key: Key("a-initput")},
+		{Key("a"), Key("b")},
+		{Key: Key("b")},
+		{Key("e"), Key("f")},
+	}
+	expWriteSpans = []Span{
+		{Key("g"), Key("h")},
+	}
+	if !reflect.DeepEqual(expReadSpans, readSpans) {
+		t.Fatalf("unexpected read spans: expected %+v, found = %+v", expReadSpans, readSpans)
+	}
+	if !reflect.DeepEqual(expWriteSpans, writeSpans) {
+		t.Fatalf("unexpected write spans: expected %+v, found = %+v", expWriteSpans, writeSpans)
+	}
+}
+
+func TestBatchResponseCombine(t *testing.T) {
+	br := &BatchResponse{}
+	{
+		txn := MakeTransaction(
+			"test", nil /* baseKey */, NormalUserPriority,
+			enginepb.SERIALIZABLE, hlc.Timestamp{WallTime: 123}, 0, /* maxOffsetNs */
+		)
+		brTxn := &BatchResponse{
+			BatchResponse_Header: BatchResponse_Header{
+				Txn: &txn,
+			},
+		}
+		if err := br.Combine(brTxn, nil); err != nil {
+			t.Fatal(err)
+		}
+		if br.Txn.Name != "test" {
+			t.Fatal("Combine() did not update the header")
+		}
+	}
+
+	br.Responses = make([]ResponseUnion, 1)
+
+	singleScanBR := func() *BatchResponse {
+		var union ResponseUnion
+		union.MustSetInner(&ScanResponse{
+			Rows: []KeyValue{{
+				Key: Key("bar"),
+			}},
+			IntentRows: []KeyValue{{
+				Key: Key("baz"),
+			}},
+		})
+		return &BatchResponse{
+			Responses: []ResponseUnion{union},
+		}
+	}
+	// Combine twice with a single scan result: first one should simply copy over, second
+	// one should add on top. Slightly different code paths internally, hence the distinction.
+	for i := 0; i < 2; i++ {
+		if err := br.Combine(singleScanBR(), []int{0}); err != nil {
+			t.Fatal(err)
+		}
+		scan := br.Responses[0].GetInner().(*ScanResponse)
+		if exp := i + 1; len(scan.Rows) != exp {
+			t.Fatalf("expected %d rows, got %+v", exp, br)
+		}
+		if exp := i + 1; len(scan.IntentRows) != exp {
+			t.Fatalf("expected %d intent rows, got %+v", exp, br)
+		}
+	}
+
+	var union ResponseUnion
+	union.MustSetInner(&PutResponse{})
+	br.Responses = []ResponseUnion{union, br.Responses[0]}
+
+	// Now we have br = [Put, Scan]. Combine should use the position to
+	// combine singleScanBR on top of the Scan at index one.
+	if err := br.Combine(singleScanBR(), []int{1}); err != nil {
+		t.Fatal(err)
+	}
+	scan := br.Responses[1].GetInner().(*ScanResponse)
+	expRows := 3
+	if len(scan.Rows) != expRows {
+		t.Fatalf("expected %d rows, got %s", expRows, pretty.Sprint(scan))
+	}
+	if len(scan.IntentRows) != expRows {
+		t.Fatalf("expected %d intent rows, got %s", expRows, pretty.Sprint(scan))
+	}
+	if err := br.Combine(singleScanBR(), []int{0}); err.Error() !=
+		`can not combine *roachpb.PutResponse and *roachpb.ScanResponse` {
+		t.Fatal(err)
 	}
 }

@@ -11,8 +11,6 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
 // implied. See the License for the specific language governing
 // permissions and limitations under the License.
-//
-// Author: Tobias Schottdorf (tobias.schottdorf@gmail.com)
 
 package encoding
 
@@ -24,12 +22,14 @@ import (
 	"testing"
 	"time"
 
-	"gopkg.in/inf.v0"
+	"github.com/pkg/errors"
 
+	"github.com/cockroachdb/apd"
 	"github.com/cockroachdb/cockroach/pkg/util/duration"
+	"github.com/cockroachdb/cockroach/pkg/util/ipaddr"
 	"github.com/cockroachdb/cockroach/pkg/util/randutil"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
-	"github.com/pkg/errors"
+	"github.com/cockroachdb/cockroach/pkg/util/uuid"
 )
 
 func testBasicEncodeDecode32(
@@ -681,8 +681,30 @@ func TestEncodeDecodeNull(t *testing.T) {
 	}
 }
 
+func TestEncodeDecodeInterleavedSentinel(t *testing.T) {
+	const hello = "hello"
+
+	buf := EncodeInterleavedSentinel([]byte(hello))
+	expected := []byte(hello + "\xfe")
+	if !bytes.Equal(expected, buf) {
+		t.Fatalf("expected %q, but found %q", expected, buf)
+	}
+
+	if remaining, isSentinel := DecodeIfInterleavedSentinel([]byte(hello)); isSentinel {
+		t.Fatalf("expected isSentinel=false, but found isSentinel=%v", isSentinel)
+	} else if hello != string(remaining) {
+		t.Fatalf("expected %q, but found %q", hello, remaining)
+	}
+
+	if remaining, isSentinel := DecodeIfNull([]byte("\x00" + hello)); !isSentinel {
+		t.Fatalf("expected isSentinel=true, but found isSentinel=%v", isSentinel)
+	} else if hello != string(remaining) {
+		t.Fatalf("expected %q, but found %q", hello, remaining)
+	}
+}
+
 func TestEncodeDecodeTime(t *testing.T) {
-	zeroTime := time.Unix(0, 0)
+	zeroTime := timeutil.Unix(0, 0)
 
 	// test cases are negative, increasing, duration offsets from the
 	// zeroTime. The positive, increasing, duration offsets are automatically
@@ -850,14 +872,15 @@ func TestPeekType(t *testing.T) {
 		{EncodeNotNullAscending(nil), NotNull},
 		{EncodeNullDescending(nil), Null},
 		{EncodeNotNullDescending(nil), NotNull},
+		{EncodeInterleavedSentinel(nil), NotNull},
 		{EncodeVarintAscending(nil, 0), Int},
 		{EncodeVarintDescending(nil, 0), Int},
 		{EncodeUvarintAscending(nil, 0), Int},
 		{EncodeUvarintDescending(nil, 0), Int},
 		{EncodeFloatAscending(nil, 0), Float},
 		{EncodeFloatDescending(nil, 0), Float},
-		{EncodeDecimalAscending(nil, inf.NewDec(0, 0)), Decimal},
-		{EncodeDecimalDescending(nil, inf.NewDec(0, 0)), Decimal},
+		{EncodeDecimalAscending(nil, apd.New(0, 0)), Decimal},
+		{EncodeDecimalDescending(nil, apd.New(0, 0)), Decimal},
 		{EncodeBytesAscending(nil, []byte("")), Bytes},
 		{EncodeBytesDescending(nil, []byte("")), BytesDesc},
 		{EncodeTimeAscending(nil, timeutil.Now()), Time},
@@ -881,15 +904,12 @@ func (rd randData) bool() bool {
 	return rd.Intn(2) == 1
 }
 
-func (rd randData) decimal() *inf.Dec {
-	d := &inf.Dec{}
-	d.SetScale(inf.Scale(rd.Intn(40) - 20))
-	d.SetUnscaled(rd.Int63())
-	return d
+func (rd randData) decimal() *apd.Decimal {
+	return apd.New(rd.Int63(), int32(rd.Intn(40)-20))
 }
 
 func (rd randData) time() time.Time {
-	return time.Unix(rd.Int63n(1000000), rd.Int63n(1000000))
+	return timeutil.Unix(rd.Int63n(1000000), rd.Int63n(1000000))
 }
 
 func (rd randData) duration() duration.Duration {
@@ -898,6 +918,10 @@ func (rd randData) duration() duration.Duration {
 		Days:   rd.Int63n(1000),
 		Nanos:  rd.Int63n(1000000),
 	}
+}
+
+func (rd randData) ipAddr() ipaddr.IPAddr {
+	return ipaddr.RandIPAddr(rd.Rand)
 }
 
 func BenchmarkEncodeUint32(b *testing.B) {
@@ -1331,7 +1355,7 @@ func TestValueEncodeDecodeBytes(t *testing.T) {
 func TestValueEncodeDecodeDecimal(t *testing.T) {
 	rng, seed := randutil.NewPseudoRand()
 	rd := randData{rng}
-	tests := make([]*inf.Dec, 1000)
+	tests := make([]*apd.Decimal, 1000)
 	for i := range tests {
 		tests[i] = rd.decimal()
 	}
@@ -1390,7 +1414,7 @@ func BenchmarkEncodeNonsortingVarint(b *testing.B) {
 	rng, _ := randutil.NewPseudoRand()
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		bytes = EncodeNonsortingVarint(bytes, rng.Int63())
+		bytes = EncodeNonsortingStdlibVarint(bytes, rng.Int63())
 	}
 }
 
@@ -1398,12 +1422,12 @@ func BenchmarkDecodeNonsortingVarint(b *testing.B) {
 	buf := make([]byte, 0, b.N*NonsortingVarintMaxLen)
 	rng, _ := randutil.NewPseudoRand()
 	for i := 0; i < b.N; i++ {
-		buf = EncodeNonsortingVarint(buf, rng.Int63())
+		buf = EncodeNonsortingStdlibVarint(buf, rng.Int63())
 	}
 	var err error
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		buf, _, _, err = DecodeNonsortingVarint(buf)
+		buf, _, _, err = DecodeNonsortingStdlibVarint(buf)
 		if err != nil {
 			b.Fatal(err)
 		}
@@ -1523,6 +1547,22 @@ func BenchmarkDecodeNonsortingUvarint(b *testing.B) {
 	}
 }
 
+func BenchmarkDecodeOneByteNonsortingUvarint(b *testing.B) {
+	buf := make([]byte, 0, b.N*NonsortingUvarintMaxLen)
+	rng, _ := randutil.NewPseudoRand()
+	for i := 0; i < b.N; i++ {
+		buf = EncodeNonsortingUvarint(buf, uint64(rng.Int63()%(1<<7)))
+	}
+	var err error
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		buf, _, _, err = DecodeNonsortingUvarint(buf)
+		if err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
 func BenchmarkPeekLengthNonsortingUvarint(b *testing.B) {
 	buf := make([]byte, 0, b.N*NonsortingUvarintMaxLen)
 	rng, _ := randutil.NewPseudoRand()
@@ -1555,7 +1595,7 @@ func randValueEncode(rd randData, buf []byte, colID uint32, typ Type) ([]byte, i
 		return EncodeFloatValue(buf, colID, x), x, true
 	case Decimal:
 		x := rd.decimal()
-		return EncodeDecimalValue(buf, colID, x), x, true
+		return EncodeDecimalValue(buf, colID, x), *x, true
 	case Bytes:
 		x := randutil.RandBytes(rd.Rand, 100)
 		return EncodeBytesValue(buf, colID, x), x, true
@@ -1565,6 +1605,9 @@ func randValueEncode(rd randData, buf []byte, colID uint32, typ Type) ([]byte, i
 	case Duration:
 		x := rd.duration()
 		return EncodeDurationValue(buf, colID, x), x, true
+	case IPAddr:
+		x := rd.ipAddr()
+		return EncodeIPAddrValue(buf, colID, x), x, true
 	default:
 		return buf, nil, false
 	}
@@ -1635,7 +1678,7 @@ func TestValueEncodingTags(t *testing.T) {
 	for i := 0; i < len(tests); i++ {
 		tests[i].colID = uint32(rng.Int63())
 		tests[i].typ = Type(rng.Intn(1000))
-		buf = encodeValueTag(buf, tests[i].colID, tests[i].typ)
+		buf = EncodeValueTag(buf, tests[i].colID, tests[i].typ)
 		tests[i].length = len(buf) - lastLen
 		lastLen = len(buf)
 	}
@@ -1714,6 +1757,8 @@ func TestValueEncodingRand(t *testing.T) {
 			buf, decoded, err = DecodeTimeValue(buf)
 		case Duration:
 			buf, decoded, err = DecodeDurationValue(buf)
+		case IPAddr:
+			buf, decoded, err = DecodeIPAddrValue(buf)
 		default:
 			err = errors.Errorf("unknown type %s", typ)
 		}
@@ -1727,7 +1772,15 @@ func TestValueEncodingRand(t *testing.T) {
 				t.Fatalf("seed %d: %s got %x expected %x", seed, typ, decoded.([]byte), value.([]byte))
 			}
 		case Decimal:
-			if decoded.(*inf.Dec).Cmp(value.(*inf.Dec)) != 0 {
+			d := decoded.(apd.Decimal)
+			val := value.(apd.Decimal)
+			if d.Cmp(&val) != 0 {
+				t.Fatalf("seed %d: %s got %v expected %v", seed, typ, decoded, value)
+			}
+		case IPAddr:
+			d := decoded.(ipaddr.IPAddr)
+			val := value.(ipaddr.IPAddr)
+			if !d.Equal(&val) {
 				t.Fatalf("seed %d: %s got %v expected %v", seed, typ, decoded, value)
 			}
 		default:
@@ -1752,7 +1805,7 @@ func TestUpperBoundValueEncodingSize(t *testing.T) {
 		{colID: 0, typ: Int, width: 100, size: 10},
 		{colID: 0, typ: Float, size: 9},
 		{colID: 0, typ: Decimal, size: -1},
-		{colID: 0, typ: Decimal, width: 100, size: 68},
+		{colID: 0, typ: Decimal, width: 100, size: 69},
 		{colID: 0, typ: Time, size: 19},
 		{colID: 0, typ: Duration, size: 28},
 		{colID: 0, typ: Bytes, size: -1},
@@ -1778,6 +1831,17 @@ func TestUpperBoundValueEncodingSize(t *testing.T) {
 }
 
 func TestPrettyPrintValueEncoded(t *testing.T) {
+	uuidStr := "63616665-6630-3064-6465-616462656562"
+	u, err := uuid.FromString(uuidStr)
+	if err != nil {
+		t.Fatalf("Bad test case. Attempted uuid.FromString(%q) got err: %d", uuidStr, err)
+	}
+	ip := "192.168.0.1/10"
+	var ipAddr ipaddr.IPAddr
+	err = ipaddr.ParseINet(ip, &ipAddr)
+	if err != nil {
+		t.Fatalf("Bad test case. Attempted ipaddr.ParseINet(%q) got err: %d", ip, err)
+	}
 	tests := []struct {
 		buf      []byte
 		expected string
@@ -1787,13 +1851,15 @@ func TestPrettyPrintValueEncoded(t *testing.T) {
 		{EncodeBoolValue(nil, NoColumnID, false), "false"},
 		{EncodeIntValue(nil, NoColumnID, 7), "7"},
 		{EncodeFloatValue(nil, NoColumnID, 6.28), "6.28"},
-		{EncodeDecimalValue(nil, NoColumnID, inf.NewDec(628, 2)), "6.28"},
+		{EncodeDecimalValue(nil, NoColumnID, apd.New(628, -2)), "6.28"},
 		{EncodeTimeValue(nil, NoColumnID,
 			time.Date(2016, 6, 29, 16, 2, 50, 5, time.UTC)), "2016-06-29T16:02:50.000000005Z"},
 		{EncodeDurationValue(nil, NoColumnID,
-			duration.Duration{Months: 1, Days: 2, Nanos: 3}), "1m2d3ns"},
+			duration.Duration{Months: 1, Days: 2, Nanos: 3}), "1mon2d3ns"},
 		{EncodeBytesValue(nil, NoColumnID, []byte{0x1, 0x2, 0xF, 0xFF}), "01020fff"},
 		{EncodeBytesValue(nil, NoColumnID, []byte("foo")), "foo"},
+		{EncodeIPAddrValue(nil, NoColumnID, ipAddr), ip},
+		{EncodeUUIDValue(nil, NoColumnID, u), uuidStr},
 	}
 	for i, test := range tests {
 		remaining, str, err := PrettyPrintValueEncoded(test.buf)
@@ -1973,11 +2039,45 @@ func BenchmarkDecodeTimeValue(b *testing.B) {
 	}
 }
 
+func BenchmarkEncodeIPAddrValue(b *testing.B) {
+	rng, _ := randutil.NewPseudoRand()
+	rd := randData{rng}
+
+	vals := make([]ipaddr.IPAddr, 10000)
+	for i := range vals {
+		vals[i] = rd.ipAddr()
+	}
+
+	buf := make([]byte, 0, 1000)
+
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		_ = EncodeIPAddrValue(buf, NoColumnID, vals[i%len(vals)])
+	}
+}
+
+func BenchmarkDecodeIPAddrValue(b *testing.B) {
+	rng, _ := randutil.NewPseudoRand()
+	rd := randData{rng}
+
+	vals := make([][]byte, 10000)
+	for i := range vals {
+		vals[i] = EncodeIPAddrValue(nil, uint32(rng.Intn(100)), rd.ipAddr())
+	}
+
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		if _, _, err := DecodeIPAddrValue(vals[i%len(vals)]); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
 func BenchmarkEncodeDecimalValue(b *testing.B) {
 	rng, _ := randutil.NewPseudoRand()
 	rd := randData{rng}
 
-	vals := make([]*inf.Dec, 10000)
+	vals := make([]*apd.Decimal, 10000)
 	for i := range vals {
 		vals[i] = rd.decimal()
 	}

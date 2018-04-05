@@ -11,18 +11,18 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
 // implied. See the License for the specific language governing
 // permissions and limitations under the License.
-//
-// Author: Radu Berinde (radu@cockroachlabs.com)
 
 package distsqlrun
 
 import (
 	"bytes"
 	"encoding/json"
+	"fmt"
 	"reflect"
 	"strings"
 	"testing"
 
+	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 )
@@ -33,12 +33,14 @@ func compareDiagrams(t *testing.T, result string, expected string) {
 	dec := json.NewDecoder(strings.NewReader(result))
 	var resData, expData diagramData
 	if err := dec.Decode(&resData); err != nil {
-		t.Fatal(err)
+		t.Fatalf("error decoding '%s': %s", result, err)
 	}
 	dec = json.NewDecoder(strings.NewReader(expected))
 	if err := dec.Decode(&expData); err != nil {
 		t.Fatal(err)
 	}
+	fmt.Printf("res: %+v\n", resData)
+	fmt.Printf("exp: %+v\n", expData)
 	if !reflect.DeepEqual(resData, expData) {
 		t.Errorf("\ngot:\n%s\nwant:\n%s", result, expected)
 	}
@@ -47,56 +49,66 @@ func compareDiagrams(t *testing.T, result string, expected string) {
 func TestPlanDiagramIndexJoin(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 
+	flows := make(map[roachpb.NodeID]FlowSpec)
+
 	desc := &sqlbase.TableDescriptor{
 		Name:    "Table",
 		Indexes: []sqlbase.IndexDescriptor{{Name: "SomeIndex"}},
 	}
 	tr := TableReaderSpec{
-		Table:         *desc,
-		IndexIdx:      1,
-		OutputColumns: []uint32{0, 1},
+		Table:    *desc,
+		IndexIdx: 1,
 	}
 
-	jr := JoinReaderSpec{
-		Table:         *desc,
-		OutputColumns: []uint32{2},
-		Filter:        Expression{Expr: "@1+@2<@3"},
-	}
-
-	f1 := FlowSpec{
+	flows[1] = FlowSpec{
 		Processors: []ProcessorSpec{{
 			Core: ProcessorCoreUnion{TableReader: &tr},
+			Post: PostProcessSpec{
+				Projection:    true,
+				OutputColumns: []uint32{0, 1},
+			},
 			Output: []OutputRouterSpec{{
 				Type: OutputRouterSpec_PASS_THROUGH,
 				Streams: []StreamEndpointSpec{
 					{StreamID: 0},
 				},
 			}},
+			StageID: 1,
 		}},
 	}
 
-	f2 := FlowSpec{
+	flows[2] = FlowSpec{
 		Processors: []ProcessorSpec{{
 			Core: ProcessorCoreUnion{TableReader: &tr},
+			Post: PostProcessSpec{
+				Projection:    true,
+				OutputColumns: []uint32{0, 1},
+			},
 			Output: []OutputRouterSpec{{
 				Type: OutputRouterSpec_PASS_THROUGH,
 				Streams: []StreamEndpointSpec{
 					{StreamID: 1},
 				},
 			}},
+			StageID: 1,
 		}},
 	}
 
-	f3 := FlowSpec{
+	flows[3] = FlowSpec{
 		Processors: []ProcessorSpec{
 			{
 				Core: ProcessorCoreUnion{TableReader: &tr},
+				Post: PostProcessSpec{
+					Projection:    true,
+					OutputColumns: []uint32{0, 1},
+				},
 				Output: []OutputRouterSpec{{
 					Type: OutputRouterSpec_PASS_THROUGH,
 					Streams: []StreamEndpointSpec{
 						{StreamID: 2},
 					},
 				}},
+				StageID: 1,
 			},
 			{
 				Input: []InputSyncSpec{{
@@ -108,69 +120,80 @@ func TestPlanDiagramIndexJoin(t *testing.T) {
 						{StreamID: 2},
 					},
 				}},
-				Core: ProcessorCoreUnion{JoinReader: &jr},
+				Core: ProcessorCoreUnion{JoinReader: &JoinReaderSpec{Table: *desc}},
+				Post: PostProcessSpec{
+					Filter:        Expression{Expr: "@1+@2<@3"},
+					Projection:    true,
+					OutputColumns: []uint32{2},
+				},
 				Output: []OutputRouterSpec{{
 					Type:    OutputRouterSpec_PASS_THROUGH,
 					Streams: []StreamEndpointSpec{{Type: StreamEndpointSpec_SYNC_RESPONSE}},
-				}}},
+				}},
+				StageID: 2,
+			},
 		},
 	}
 
-	var buf bytes.Buffer
-	if err := GeneratePlanDiagram(
-		[]FlowSpec{f1, f2, f3}, []string{"1", "2", "3"}, &buf,
-	); err != nil {
+	json, url, err := GeneratePlanDiagramWithURL(flows)
+	if err != nil {
 		t.Fatal(err)
 	}
 
 	expected := `
-		{"nodeNames":["1","2","3"],
-			"processors":[
-				{"nodeIdx":0,"inputs":[],"core":{"title":"TableReader","details":["SomeIndex@Table","@1,@2"]},"outputs":[]},
-				{"nodeIdx":1,"inputs":[],"core":{"title":"TableReader","details":["SomeIndex@Table","@1,@2"]},"outputs":[]},
-				{"nodeIdx":2,"inputs":[],"core":{"title":"TableReader","details":["SomeIndex@Table","@1,@2"]},"outputs":[]},
-				{"nodeIdx":2,"inputs":[{"title":"ordered","details":["@2+"]}],"core":{"title":"JoinReader","details":["primary@Table","@3","@1+@2\u003c@3"]},"outputs":[]},
-				{"nodeIdx":2,"inputs":[],"core":{"title":"Response","details":[]},"outputs":[]}
-			],
-			"edges":[
-				{"sourceProc":0,"sourceOutput":0,"destProc":3,"destInput":1},
-				{"sourceProc":1,"sourceOutput":0,"destProc":3,"destInput":1},
-				{"sourceProc":2,"sourceOutput":0,"destProc":3,"destInput":1},
-				{"sourceProc":3,"sourceOutput":0,"destProc":4,"destInput":0}
-			]
-		}
+		{
+		  "nodeNames":["1","2","3"],
+		  "processors":[
+			  {"nodeIdx":0,"inputs":[],"core":{"title":"TableReader","details":["SomeIndex@Table","Out: @1,@2"]},"outputs":[],"stage":1},
+				{"nodeIdx":1,"inputs":[],"core":{"title":"TableReader","details":["SomeIndex@Table","Out: @1,@2"]},"outputs":[],"stage":1},
+				{"nodeIdx":2,"inputs":[],"core":{"title":"TableReader","details":["SomeIndex@Table","Out: @1,@2"]},"outputs":[],"stage":1},
+				{"nodeIdx":2,"inputs":[{"title":"ordered","details":["@2+"]}],"core":{"title":"JoinReader","details":["primary@Table","Filter: @1+@2\u003c@3","Out: @3"]},"outputs":[],"stage":2},
+		    {"nodeIdx":2,"inputs":[],"core":{"title":"Response","details":[]},"outputs":[]}
+		  ],
+		  "edges":[
+		    {"sourceProc":0,"sourceOutput":0,"destProc":3,"destInput":1},
+		    {"sourceProc":1,"sourceOutput":0,"destProc":3,"destInput":1},
+		    {"sourceProc":2,"sourceOutput":0,"destProc":3,"destInput":1},
+		    {"sourceProc":3,"sourceOutput":0,"destProc":4,"destInput":0}
+		  ]
+	  }
 	`
 
-	compareDiagrams(t, buf.String(), expected)
+	compareDiagrams(t, json, expected)
+
+	expectedURL := "https://cockroachdb.github.io/distsqlplan/decode.html?eJzMkj9rwzAQxfd-ivLWaLClTpo0FdKhKWm31oNqHUHgSOYkQ0rwdy-WIX8gKZQM7ai7e-_97tAeITp6tltK0O-oISAhoNAI9BxbSiny1JoHl24HXQn40A95KjcCbWSC3iP73BE03uxnR2uyjhgCjrL1XTF_jVtaBkc7U0YgsBqyvje1MBLNKBCHfLRN2W4Iuh7FSXT9d9Hyf0QfEyM7YnLnaUYu0IwX-J6iD5fwevZby18HuEffZeKJb2Hkx1BVqjXqAK2uEsvfHGtNqY8h0RnKNedqWofchub1Uxy4pReObfmJ83NVdKXgKOW5q-bHMpRWOempuL5FLG8Rqx_FD2fiamzGu-8AAAD__1hrMTc="
+	if url.String() != expectedURL {
+		t.Errorf("expected `%s` got `%s`", expectedURL, &url)
+	}
 }
 
 func TestPlanDiagramJoin(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 
+	flows := make(map[roachpb.NodeID]FlowSpec)
+
 	descA := &sqlbase.TableDescriptor{Name: "TableA"}
 	descB := &sqlbase.TableDescriptor{Name: "TableB"}
 
-	trA := TableReaderSpec{
-		Table:         *descA,
-		OutputColumns: []uint32{0, 1, 3},
-	}
+	trA := TableReaderSpec{Table: *descA}
 
-	trB := TableReaderSpec{
-		Table:         *descB,
-		OutputColumns: []uint32{1, 2, 4},
-	}
+	trB := TableReaderSpec{Table: *descB}
 
 	hj := HashJoinerSpec{
 		LeftEqColumns:  []uint32{0, 2},
 		RightEqColumns: []uint32{2, 1},
-		OutputColumns:  []uint32{0, 1, 2, 3, 4, 5},
-		Expr:           Expression{Expr: "@1+@2<@6"},
+		OnExpr:         Expression{Expr: "@1+@2<@6"},
+		MergedColumns:  true,
 	}
 
-	f1 := FlowSpec{
+	flows[1] = FlowSpec{
 		Processors: []ProcessorSpec{
 			{
 				Core: ProcessorCoreUnion{TableReader: &trA},
+				Post: PostProcessSpec{
+					Projection:    true,
+					OutputColumns: []uint32{0, 1, 3},
+				},
 				Output: []OutputRouterSpec{{
 					Type:        OutputRouterSpec_BY_HASH,
 					HashColumns: []uint32{0, 1},
@@ -183,10 +206,14 @@ func TestPlanDiagramJoin(t *testing.T) {
 		},
 	}
 
-	f2 := FlowSpec{
+	flows[2] = FlowSpec{
 		Processors: []ProcessorSpec{
 			{
 				Core: ProcessorCoreUnion{TableReader: &trA},
+				Post: PostProcessSpec{
+					Projection:    true,
+					OutputColumns: []uint32{0, 1, 3},
+				},
 				Output: []OutputRouterSpec{{
 					Type:        OutputRouterSpec_BY_HASH,
 					HashColumns: []uint32{0, 1},
@@ -215,6 +242,10 @@ func TestPlanDiagramJoin(t *testing.T) {
 					},
 				},
 				Core: ProcessorCoreUnion{HashJoiner: &hj},
+				Post: PostProcessSpec{
+					Projection:    true,
+					OutputColumns: []uint32{0, 1, 2, 3, 4, 5},
+				},
 				Output: []OutputRouterSpec{{
 					Type: OutputRouterSpec_PASS_THROUGH,
 					Streams: []StreamEndpointSpec{
@@ -238,10 +269,14 @@ func TestPlanDiagramJoin(t *testing.T) {
 		},
 	}
 
-	f3 := FlowSpec{
+	flows[3] = FlowSpec{
 		Processors: []ProcessorSpec{
 			{
 				Core: ProcessorCoreUnion{TableReader: &trA},
+				Post: PostProcessSpec{
+					Projection:    true,
+					OutputColumns: []uint32{0, 1, 3},
+				},
 				Output: []OutputRouterSpec{{
 					Type:        OutputRouterSpec_BY_HASH,
 					HashColumns: []uint32{0, 1},
@@ -253,6 +288,10 @@ func TestPlanDiagramJoin(t *testing.T) {
 			},
 			{
 				Core: ProcessorCoreUnion{TableReader: &trB},
+				Post: PostProcessSpec{
+					Projection:    true,
+					OutputColumns: []uint32{1, 2, 4},
+				},
 				Output: []OutputRouterSpec{{
 					Type:        OutputRouterSpec_BY_HASH,
 					HashColumns: []uint32{2, 1},
@@ -291,9 +330,13 @@ func TestPlanDiagramJoin(t *testing.T) {
 		},
 	}
 
-	f4 := FlowSpec{
+	flows[4] = FlowSpec{
 		Processors: []ProcessorSpec{{
 			Core: ProcessorCoreUnion{TableReader: &trB},
+			Post: PostProcessSpec{
+				Projection:    true,
+				OutputColumns: []uint32{1, 2, 4},
+			},
 			Output: []OutputRouterSpec{{
 				Type:        OutputRouterSpec_BY_HASH,
 				HashColumns: []uint32{2, 1},
@@ -306,9 +349,7 @@ func TestPlanDiagramJoin(t *testing.T) {
 	}
 
 	var buf bytes.Buffer
-	if err := GeneratePlanDiagram(
-		[]FlowSpec{f1, f2, f3, f4}, []string{"1", "2", "3", "4"}, &buf,
-	); err != nil {
+	if err := GeneratePlanDiagram(flows, &buf); err != nil {
 		t.Fatal(err)
 	}
 
@@ -316,18 +357,18 @@ func TestPlanDiagramJoin(t *testing.T) {
 		{
 			"nodeNames":["1","2","3","4"],
 			"processors":[
-				{"nodeIdx":0,"inputs":[],"core":{"title":"TableReader","details":["primary@TableA","@1,@2,@4"]},"outputs":[{"title":"by hash","details":["@1,@2"]}]},
-				{"nodeIdx":1,"inputs":[],"core":{"title":"TableReader","details":["primary@TableA","@1,@2,@4"]},"outputs":[{"title":"by hash","details":["@1,@2"]}]},
-				{"nodeIdx":1,"inputs":[{"title":"unordered","details":[]},{"title":"unordered","details":[]}],"core":{"title":"HashJoiner","details":["ON left(@1,@3)=right(@3,@2)","@1,@2,@3,@4,@5,@6","@1+@2\u003c@6"]},"outputs":[]},
+				{"nodeIdx":0,"inputs":[],"core":{"title":"TableReader","details":["primary@TableA","Out: @1,@2,@4"]},"outputs":[{"title":"by hash","details":["@1,@2"]}]},
+				{"nodeIdx":1,"inputs":[],"core":{"title":"TableReader","details":["primary@TableA","Out: @1,@2,@4"]},"outputs":[{"title":"by hash","details":["@1,@2"]}]},
+				{"nodeIdx":1,"inputs":[{"title":"unordered","details":[]},{"title":"unordered","details":[]}],"core":{"title":"HashJoiner","details":["left(@1,@3)=right(@3,@2)","ON @1+@2\u003c@6","Merged columns: 2","Out: @1,@2,@3,@4,@5,@6"]},"outputs":[]},
 				{"nodeIdx":1,"inputs":[{"title":"unordered","details":[]}],"core":{"title":"No-op","details":[]},"outputs":[]},
-				{"nodeIdx":2,"inputs":[],"core":{"title":"TableReader","details":["primary@TableA","@1,@2,@4"]},"outputs":[{"title":"by hash","details":["@1,@2"]}]},
-				{"nodeIdx":2,"inputs":[],"core":{"title":"TableReader","details":["primary@TableB","@2,@3,@5"]},"outputs":[{"title":"by hash","details":["@3,@2"]}]},
-				{"nodeIdx":2,"inputs":[{"title":"unordered","details":[]},{"title":"unordered","details":[]}],"core":{"title":"HashJoiner","details":["ON left(@1,@3)=right(@3,@2)","@1,@2,@3,@4,@5,@6","@1+@2\u003c@6"]},"outputs":[]},
-				{"nodeIdx":3,"inputs":[],"core":{"title":"TableReader","details":["primary@TableB","@2,@3,@5"]},"outputs":[{"title":"by hash","details":["@3,@2"]}]},
+				{"nodeIdx":2,"inputs":[],"core":{"title":"TableReader","details":["primary@TableA","Out: @1,@2,@4"]},"outputs":[{"title":"by hash","details":["@1,@2"]}]},
+				{"nodeIdx":2,"inputs":[],"core":{"title":"TableReader","details":["primary@TableB","Out: @2,@3,@5"]},"outputs":[{"title":"by hash","details":["@3,@2"]}]},
+				{"nodeIdx":2,"inputs":[{"title":"unordered","details":[]},{"title":"unordered","details":[]}],"core":{"title":"HashJoiner","details":["left(@1,@3)=right(@3,@2)","ON @1+@2\u003c@6","Merged columns: 2"]},"outputs":[]},
+				{"nodeIdx":3,"inputs":[],"core":{"title":"TableReader","details":["primary@TableB","Out: @2,@3,@5"]},"outputs":[{"title":"by hash","details":["@3,@2"]}]},
 				{"nodeIdx":1,"inputs":[],"core":{"title":"Response","details":[]},"outputs":[]}
 			],
 			"edges":[
-				{"sourceProc":0,"sourceOutput":1,"destProc":2,"destInput":1},
+			  {"sourceProc":0,"sourceOutput":1,"destProc":2,"destInput":1},
 				{"sourceProc":0,"sourceOutput":1,"destProc":6,"destInput":1},
 				{"sourceProc":1,"sourceOutput":1,"destProc":2,"destInput":1},
 				{"sourceProc":1,"sourceOutput":1,"destProc":6,"destInput":1},
@@ -341,7 +382,7 @@ func TestPlanDiagramJoin(t *testing.T) {
 				{"sourceProc":7,"sourceOutput":1,"destProc":2,"destInput":2},
 				{"sourceProc":7,"sourceOutput":1,"destProc":6,"destInput":2}
 			]
-		}
+	  }
 	`
 
 	compareDiagrams(t, buf.String(), expected)

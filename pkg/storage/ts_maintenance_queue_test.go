@@ -11,25 +11,25 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
 // implied. See the License for the specific language governing
 // permissions and limitations under the License.
-//
-// Author: Matt Tracy (matt@cockroachlabs.com)
 
 package storage_test
 
 import (
+	"context"
 	"fmt"
+	"math"
 	"reflect"
 	"testing"
 	"time"
 
 	"github.com/kr/pretty"
 	"github.com/pkg/errors"
-	"golang.org/x/net/context"
 
 	"github.com/cockroachdb/cockroach/pkg/base"
 	"github.com/cockroachdb/cockroach/pkg/internal/client"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/server"
+	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/storage"
 	"github.com/cockroachdb/cockroach/pkg/storage/engine"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
@@ -38,6 +38,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/ts/tspb"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
+	"github.com/cockroachdb/cockroach/pkg/util/mon"
 	"github.com/cockroachdb/cockroach/pkg/util/stop"
 	"github.com/cockroachdb/cockroach/pkg/util/syncutil"
 )
@@ -104,14 +105,14 @@ func TestTimeSeriesMaintenanceQueue(t *testing.T) {
 	cfg.TestingKnobs.DisableSplitQueue = true
 
 	stopper := stop.NewStopper()
-	defer stopper.Stop()
+	defer stopper.Stop(context.TODO())
 	store := createTestStoreWithConfig(t, stopper, cfg)
 
 	// Generate several splits.
 	splitKeys := []roachpb.Key{roachpb.Key("c"), roachpb.Key("b"), roachpb.Key("a")}
 	for _, k := range splitKeys {
 		repl := store.LookupReplica(roachpb.RKey(k), nil)
-		args := adminSplitArgs(k, k)
+		args := adminSplitArgs(k)
 		if _, pErr := client.SendWrappedWith(context.Background(), store, roachpb.Header{
 			RangeID: repl.RangeID,
 		}, args); pErr != nil {
@@ -226,7 +227,7 @@ func TestTimeSeriesMaintenanceQueueServer(t *testing.T) {
 			},
 		},
 	})
-	defer s.Stopper().Stop()
+	defer s.Stopper().Stop(context.TODO())
 	tsrv := s.(*server.TestServer)
 	tsdb := tsrv.TsDB()
 
@@ -236,9 +237,12 @@ func TestTimeSeriesMaintenanceQueueServer(t *testing.T) {
 	// periods; this simplifies verification.
 	seriesName := "test.metric"
 	sourceName := "source1"
-	now := tsrv.Clock().PhysicalNow()
-	nearPast := now - (ts.Resolution10s.PruneThreshold() * 2)
-	farPast := now - (ts.Resolution10s.PruneThreshold() * 4)
+	// "now" is five minutes in the past to avoid any sort of shenanigans with the
+	// various adjustments we make in the very-recent-past to create consistent
+	// graphs.
+	now := tsrv.Clock().PhysicalNow() - int64(5*time.Minute)
+	nearPast := now - (tsdb.PruneThreshold(ts.Resolution10s) * 2)
+	farPast := now - (tsdb.PruneThreshold(ts.Resolution10s) * 4)
 	sampleDuration := ts.Resolution10s.SampleDuration()
 	datapoints := []tspb.TimeSeriesDatapoint{
 		{
@@ -271,9 +275,23 @@ func TestTimeSeriesMaintenanceQueueServer(t *testing.T) {
 
 	// Force a range split in between near past and far past. This guarantees
 	// that the pruning operation will issue a DeleteRange which spans ranges.
-	if err := db.AdminSplit(context.TODO(), splitKey); err != nil {
+	if err := db.AdminSplit(context.TODO(), splitKey, splitKey); err != nil {
 		t.Fatal(err)
 	}
+
+	memMon := mon.MakeMonitor(
+		"test",
+		mon.MemoryResource,
+		nil,           /* curCount */
+		nil,           /* maxHist */
+		-1,            /* increment: use default block size */
+		math.MaxInt64, /* noteworthy */
+		cluster.MakeTestingClusterSettings(),
+	)
+	memMon.Start(context.TODO(), nil /* pool */, mon.MakeStandaloneBudget(math.MaxInt64))
+	defer memMon.Stop(context.TODO())
+	acc := memMon.MakeBoundAccount()
+	defer acc.Close(context.TODO())
 
 	// getDatapoints queries all datapoints in the series from the beginning
 	// of time to a point in the near future.
@@ -285,6 +303,9 @@ func TestTimeSeriesMaintenanceQueueServer(t *testing.T) {
 			ts.Resolution10s.SampleDuration(),
 			0,
 			now+ts.Resolution10s.SlabDuration(),
+			0,
+			&acc,
+			&memMon,
 		)
 		return dps, err
 	}

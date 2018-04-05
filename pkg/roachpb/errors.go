@@ -11,12 +11,11 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
 // implied. See the License for the specific language governing
 // permissions and limitations under the License.
-//
-// Author: Spencer Kimball (spencer.kimball@gmail.com)
 
 package roachpb
 
 import (
+	"bytes"
 	"fmt"
 
 	"github.com/cockroachdb/cockroach/pkg/util/caller"
@@ -24,39 +23,11 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/uuid"
 )
 
-// RetryableTxnError represents a retryable transaction error - the transaction
-// that caused it should be re-run.
-type RetryableTxnError struct {
-	message string
-	TxnID   *uuid.UUID
-	// TODO(spencer): Get rid of BACKOFF retries. Note that we don't propagate
-	// the backoff hint to the client anyway. See #5249
-	Backoff bool
-
-	// The error that this RetryableTxnError wraps. Useful for tests that want to
-	// assert that they got the expected error.
-	Cause ErrorDetailInterface
-
-	// TODO(andrei): These are here temporarily for facilitation converting
-	// RetryableTxnError to pErr. Get rid of it afterwards.
-	Transaction *Transaction
-	CauseProto  *ErrorDetail
+func (e *UnhandledRetryableError) Error() string {
+	return e.PErr.Message
 }
 
-func (e *RetryableTxnError) Error() string {
-	return e.message
-}
-
-var _ error = &RetryableTxnError{}
-
-// NewRetryableTxnError creates a shim RetryableTxnError that
-// reports the given cause when converted to String(). This can be
-// used to fake/force a retry at the SQL layer.
-func NewRetryableTxnError(cause string) *RetryableTxnError {
-	return &RetryableTxnError{
-		message: cause,
-	}
-}
+var _ error = &UnhandledRetryableError{}
 
 // ErrorUnexpectedlySet creates a string to panic with when a response (typically
 // a roachpb.BatchResponse) unexpectedly has Error set in its response header.
@@ -95,18 +66,16 @@ func NewError(err error) *Error {
 	e := &Error{}
 	if intErr, ok := err.(*internalError); ok {
 		*e = *(*Error)(intErr)
-	} else if _, ok := err.(*RetryableTxnError); ok {
-		// This shouldn't happen. The few unfortunate bastards that need to go from
-		// RetryableTxnError to pErr should do it explicitly through
-		// RetryableTxnErrorToPErr().
-		panic("RetryableTxnError being converted back to pErr.")
 	} else {
 		e.setGoError(err)
 	}
+
 	return e
 }
 
 // NewErrorWithTxn creates an Error from the given error and a transaction.
+//
+// txn is cloned before being stored in Error.
 func NewErrorWithTxn(err error, txn *Transaction) *Error {
 	e := NewError(err)
 	e.SetTxn(txn)
@@ -159,23 +128,13 @@ func (e *Error) GoError() error {
 	if e == nil {
 		return nil
 	}
+
 	if e.TransactionRestart != TransactionRestart_NONE {
-		backoff := e.TransactionRestart == TransactionRestart_BACKOFF
-		var txnID *uuid.UUID
-		if e.GetTxn() != nil {
-			txnID = e.GetTxn().ID
-		}
-		return &RetryableTxnError{
-			message:     e.Message,
-			TxnID:       txnID,
-			Transaction: e.GetTxn(),
-			Cause:       e.GetDetail(),
-			CauseProto:  e.Detail,
-			Backoff:     backoff,
+		return &UnhandledRetryableError{
+			PErr: *e,
 		}
 	}
-	detail := e.GetDetail()
-	return detail
+	return e.GetDetail()
 }
 
 // setGoError sets Error using err.
@@ -202,7 +161,8 @@ func (e *Error) setGoError(err error) {
 	}
 }
 
-// SetTxn sets the txn and resets the error message.
+// SetTxn sets the txn and resets the error message. txn is cloned before being
+// stored in the Error.
 // TODO(kaneda): Unexpose this method and make callers use NewErrorWithTxn.
 func (e *Error) SetTxn(txn *Transaction) {
 	e.UnexposedTxn = txn
@@ -258,12 +218,16 @@ func (e *NotLeaseHolderError) Error() string {
 }
 
 func (e *NotLeaseHolderError) message(_ *Error) string {
-	if e.LeaseHolder == nil {
-		return fmt.Sprintf("range %d: replica %s not lease holder; lease holder unknown", e.RangeID, e.Replica)
-	} else if e.Lease != nil {
-		return fmt.Sprintf("range %d: replica %s not lease holder; current lease is %s", e.RangeID, e.Replica, e.Lease)
+	const prefix = "[NotLeaseHolderError] "
+	if e.CustomMsg != "" {
+		return prefix + e.CustomMsg
 	}
-	return fmt.Sprintf("range %d: replica %s not lease holder; replica %s is", e.RangeID, e.Replica, *e.LeaseHolder)
+	if e.LeaseHolder == nil {
+		return fmt.Sprintf("%sr%d: replica %s not lease holder; lease holder unknown", prefix, e.RangeID, e.Replica)
+	} else if e.Lease != nil {
+		return fmt.Sprintf("%sr%d: replica %s not lease holder; current lease is %s", prefix, e.RangeID, e.Replica, e.Lease)
+	}
+	return fmt.Sprintf("%sr%d: replica %s not lease holder; replica %s is", prefix, e.RangeID, e.Replica, *e.LeaseHolder)
 }
 
 var _ ErrorDetailInterface = &NotLeaseHolderError{}
@@ -305,7 +269,7 @@ func (e *RangeNotFoundError) Error() string {
 }
 
 func (e *RangeNotFoundError) message(_ *Error) string {
-	return fmt.Sprintf("range %d was not found", e.RangeID)
+	return fmt.Sprintf("r%d was not found", e.RangeID)
 }
 
 var _ ErrorDetailInterface = &RangeNotFoundError{}
@@ -338,21 +302,6 @@ func (e *RangeKeyMismatchError) message(_ *Error) string {
 
 var _ ErrorDetailInterface = &RangeKeyMismatchError{}
 
-// NewRangeFrozenError initializes a new RangeFrozenError.
-func NewRangeFrozenError(desc RangeDescriptor) *RangeFrozenError {
-	return &RangeFrozenError{Desc: desc}
-}
-
-func (e *RangeFrozenError) Error() string {
-	return fmt.Sprintf("range is frozen: %s", e.Desc)
-}
-
-func (e *RangeFrozenError) message(_ *Error) string {
-	return e.Error()
-}
-
-var _ ErrorDetailInterface = &RangeFrozenError{}
-
 // NewAmbiguousResultError initializes a new AmbiguousResultError with
 // an explanatory message.
 func NewAmbiguousResultError(msg string) *AmbiguousResultError {
@@ -370,23 +319,43 @@ func (e *AmbiguousResultError) message(_ *Error) string {
 var _ ErrorDetailInterface = &AmbiguousResultError{}
 
 func (e *TransactionAbortedError) Error() string {
-	return "txn aborted"
+	return "TransactionAbortedError: txn aborted"
 }
 
 func (e *TransactionAbortedError) message(pErr *Error) string {
-	return fmt.Sprintf("txn aborted %s", pErr.GetTxn())
+	return fmt.Sprintf("TransactionAbortedError: txn aborted %s", pErr.GetTxn())
 }
 
 func (*TransactionAbortedError) canRestartTransaction() TransactionRestart {
-	return TransactionRestart_BACKOFF
+	return TransactionRestart_IMMEDIATE
 }
 
 var _ ErrorDetailInterface = &TransactionAbortedError{}
 var _ transactionRestartError = &TransactionAbortedError{}
 
+func (e *HandledRetryableTxnError) Error() string {
+	return e.message(nil)
+}
+
+func (e *HandledRetryableTxnError) message(_ *Error) string {
+	return fmt.Sprintf("HandledRetryableTxnError: %s", e.Msg)
+}
+
+var _ ErrorDetailInterface = &HandledRetryableTxnError{}
+
 // NewTransactionAbortedError initializes a new TransactionAbortedError.
 func NewTransactionAbortedError() *TransactionAbortedError {
 	return &TransactionAbortedError{}
+}
+
+// NewHandledRetryableTxnError initializes a new HandledRetryableTxnError.
+//
+// txnID is the ID of the transaction being restarted.
+// txn is the transaction that the client should use for the next attempts.
+func NewHandledRetryableTxnError(
+	msg string, txnID uuid.UUID, txn Transaction,
+) *HandledRetryableTxnError {
+	return &HandledRetryableTxnError{Msg: msg, TxnID: txnID, Transaction: txn}
 }
 
 // NewTransactionPushError initializes a new TransactionPushError.
@@ -412,22 +381,22 @@ var _ ErrorDetailInterface = &TransactionPushError{}
 var _ transactionRestartError = &TransactionPushError{}
 
 func (*TransactionPushError) canRestartTransaction() TransactionRestart {
-	return TransactionRestart_BACKOFF
+	return TransactionRestart_IMMEDIATE
 }
 
 // NewTransactionRetryError initializes a new TransactionRetryError.
-func NewTransactionRetryError() *TransactionRetryError {
-	return &TransactionRetryError{}
+func NewTransactionRetryError(reason TransactionRetryReason) *TransactionRetryError {
+	return &TransactionRetryError{
+		Reason: reason,
+	}
 }
 
-// TODO(kaneda): Delete this method once we fully unimplement error for every
-// error detail.
 func (e *TransactionRetryError) Error() string {
-	return fmt.Sprintf("retry txn")
+	return fmt.Sprintf("TransactionRetryError: retry txn (%s)", e.Reason)
 }
 
 func (e *TransactionRetryError) message(pErr *Error) string {
-	return fmt.Sprintf("retry txn %s", pErr.GetTxn())
+	return fmt.Sprintf("%s: %s", e.Error(), pErr.GetTxn())
 }
 
 var _ ErrorDetailInterface = &TransactionRetryError{}
@@ -455,15 +424,27 @@ var _ ErrorDetailInterface = &TransactionReplayError{}
 // NewTransactionStatusError initializes a new TransactionStatusError from
 // the given message.
 func NewTransactionStatusError(msg string) *TransactionStatusError {
-	return &TransactionStatusError{Msg: msg}
+	return &TransactionStatusError{
+		Msg:    msg,
+		Reason: TransactionStatusError_REASON_UNKNOWN,
+	}
+}
+
+// NewTransactionNotFoundStatusError initializes a new TransactionStatusError with
+// a REASON_TXN_NOT_FOUND reason.
+func NewTransactionNotFoundStatusError() *TransactionStatusError {
+	return &TransactionStatusError{
+		Msg:    "txn record not found",
+		Reason: TransactionStatusError_REASON_TXN_NOT_FOUND,
+	}
 }
 
 func (e *TransactionStatusError) Error() string {
-	return e.Msg
+	return fmt.Sprintf("TransactionStatusError: %s (%s)", e.Msg, e.Reason)
 }
 
 func (e *TransactionStatusError) message(pErr *Error) string {
-	return fmt.Sprintf("txn %s: %s", pErr.GetTxn(), e.Msg)
+	return fmt.Sprintf("%s: %s", e.Error(), pErr.GetTxn())
 }
 
 var _ ErrorDetailInterface = &TransactionStatusError{}
@@ -473,11 +454,36 @@ func (e *WriteIntentError) Error() string {
 }
 
 func (e *WriteIntentError) message(_ *Error) string {
-	var keys []Key
-	for _, intent := range e.Intents {
-		keys = append(keys, intent.Key)
+	var buf bytes.Buffer
+	buf.WriteString("conflicting intents on ")
+
+	// If we have a lot of intents, we only want to show the first and the last.
+	const maxBegin = 5
+	const maxEnd = 5
+	var begin, end []Intent
+	if len(e.Intents) <= maxBegin+maxEnd {
+		begin = e.Intents
+	} else {
+		begin = e.Intents[0:maxBegin]
+		end = e.Intents[len(e.Intents)-maxEnd : len(e.Intents)]
 	}
-	return fmt.Sprintf("conflicting intents on %v: resolved? %t", keys, e.Resolved)
+
+	for i := range begin {
+		if i > 0 {
+			buf.WriteString(", ")
+		}
+		buf.WriteString(begin[i].Key.String())
+	}
+	if end != nil {
+		buf.WriteString(" ... ")
+		for i := range end {
+			if i > 0 {
+				buf.WriteString(", ")
+			}
+			buf.WriteString(end[i].Key.String())
+		}
+	}
+	return buf.String()
 }
 
 var _ ErrorDetailInterface = &WriteIntentError{}
@@ -487,7 +493,8 @@ func (e *WriteTooOldError) Error() string {
 }
 
 func (e *WriteTooOldError) message(_ *Error) string {
-	return fmt.Sprintf("write at timestamp %s too old; wrote at %s", e.Timestamp, e.ActualTimestamp)
+	return fmt.Sprintf("WriteTooOldError: write at timestamp %s too old; wrote at %s",
+		e.Timestamp, e.ActualTimestamp)
 }
 
 var _ ErrorDetailInterface = &WriteTooOldError{}
@@ -498,15 +505,21 @@ func (*WriteTooOldError) canRestartTransaction() TransactionRestart {
 }
 
 // NewReadWithinUncertaintyIntervalError creates a new uncertainty retry error.
-// The read and existing timestamps are purely informational and used for
-// formatting the error message.
+// The read and existing timestamps as well as the txn are purely informational
+// and used for formatting the error message.
 func NewReadWithinUncertaintyIntervalError(
-	readTS, existingTS hlc.Timestamp,
+	readTS, existingTS hlc.Timestamp, txn *Transaction,
 ) *ReadWithinUncertaintyIntervalError {
-	return &ReadWithinUncertaintyIntervalError{
+	rwue := &ReadWithinUncertaintyIntervalError{
 		ReadTimestamp:     readTS,
 		ExistingTimestamp: existingTS,
 	}
+	if txn != nil {
+		maxTS := txn.MaxTimestamp
+		rwue.MaxTimestamp = &maxTS
+		rwue.ObservedTimestamps = append([]ObservedTimestamp(nil), txn.ObservedTimestamps...)
+	}
+	return rwue
 }
 
 func (e *ReadWithinUncertaintyIntervalError) Error() string {
@@ -514,7 +527,10 @@ func (e *ReadWithinUncertaintyIntervalError) Error() string {
 }
 
 func (e *ReadWithinUncertaintyIntervalError) message(_ *Error) string {
-	return fmt.Sprintf("read at time %s encountered previous write with future timestamp %s within uncertainty interval", e.ReadTimestamp, e.ExistingTimestamp)
+	return fmt.Sprintf("ReadWithinUncertaintyIntervalError: read at time %s encountered "+
+		"previous write with future timestamp %s within uncertainty interval `t <= %v`; "+
+		"observed timestamps: %v",
+		e.ReadTimestamp, e.ExistingTimestamp, e.MaxTimestamp, observedTimestampSlice(e.ObservedTimestamps))
 }
 
 var _ ErrorDetailInterface = &ReadWithinUncertaintyIntervalError{}
@@ -601,3 +617,55 @@ func (e *StoreNotFoundError) message(_ *Error) string {
 }
 
 var _ ErrorDetailInterface = &StoreNotFoundError{}
+
+func (e *TxnPrevAttemptError) Error() string {
+	return e.message(nil)
+}
+
+func (*TxnPrevAttemptError) message(_ *Error) string {
+	return "response meant for previous incarnation of transaction"
+}
+
+var _ ErrorDetailInterface = &TxnPrevAttemptError{}
+
+func (e *IntegerOverflowError) Error() string {
+	return e.message(nil)
+}
+
+func (e *IntegerOverflowError) message(_ *Error) string {
+	return fmt.Sprintf(
+		"key %s with value %d incremented by %d results in overflow",
+		e.Key, e.CurrentValue, e.IncrementValue)
+}
+
+var _ ErrorDetailInterface = &IntegerOverflowError{}
+
+func (e *UnsupportedRequestError) Error() string {
+	return e.message(nil)
+}
+
+func (e *UnsupportedRequestError) message(_ *Error) string {
+	return "unsupported request"
+}
+
+var _ ErrorDetailInterface = &UnsupportedRequestError{}
+
+func (e *MixedSuccessError) Error() string {
+	return e.message(nil)
+}
+
+func (e *MixedSuccessError) message(_ *Error) string {
+	return "the batch experienced mixed success and failure"
+}
+
+var _ ErrorDetailInterface = &MixedSuccessError{}
+
+func (e *BatchTimestampBeforeGCError) Error() string {
+	return e.message(nil)
+}
+
+func (e *BatchTimestampBeforeGCError) message(_ *Error) string {
+	return fmt.Sprintf("batch timestamp %v must be after GC threshold %v", e.Timestamp, e.Threshold)
+}
+
+var _ ErrorDetailInterface = &BatchTimestampBeforeGCError{}

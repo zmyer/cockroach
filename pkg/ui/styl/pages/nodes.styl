@@ -1,17 +1,15 @@
-.node-overview
-  .stats-table
-    table
-      td, th
-        &:first-child
-          width: calc(45px - 3rem)
-
-.section.node, .section.nodes
-  .charts
-    width $chart-width
-
-    h2
-      clear both
-      padding-top 15px
-
-      &:first-child
-        padding-top 0
+.node-status-icon
+  display inline
+  padding-right 9px
+  font-size 6px
+  line-height 14px
+  vertical-align middle
+  
+  &--dead
+    color $alert-color
+  &--suspect
+    color $warning-color
+  &--decommissioning
+    color $warning-color
+  &--healthy
+    color $healthy-color

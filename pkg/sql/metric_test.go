@@ -11,17 +11,17 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
 // implied. See the License for the specific language governing
 // permissions and limitations under the License.
-//
-// Author: Cuong Do (cdo@cockroachlabs.com)
 
 package sql_test
 
 import (
 	"bytes"
+	"context"
 	"testing"
 
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/sql"
+	"github.com/cockroachdb/cockroach/pkg/sql/tests"
 	"github.com/cockroachdb/cockroach/pkg/storage/storagebase"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/serverutils"
@@ -40,16 +40,19 @@ type queryCounter struct {
 	miscCount          int64
 	txnCommitCount     int64
 	txnRollbackCount   int64
+	txnAbortCount      int64
 }
 
 func TestQueryCounts(t *testing.T) {
 	defer leaktest.AfterTest(t)()
-	params, _ := createTestServerParams()
+
+	params, _ := tests.CreateTestServerParams()
 	s, sqlDB, _ := serverutils.StartServer(t, params)
-	defer s.Stopper().Stop()
+	defer s.Stopper().Stop(context.TODO())
 
 	var testcases = []queryCounter{
 		// The counts are deltas for each query.
+		{query: "SET DISTSQL = 'off'", miscCount: 1},
 		{query: "BEGIN; END", txnBeginCount: 1, txnCommitCount: 1},
 		{query: "SELECT 1", selectCount: 1, txnCommitCount: 1},
 		{query: "CREATE DATABASE mt", ddlCount: 1},
@@ -64,16 +67,14 @@ func TestQueryCounts(t *testing.T) {
 			txnBeginCount: 1, updateCount: 1, txnCommitCount: 1,
 		},
 		{query: "SELECT * FROM mt.n; SELECT * FROM mt.n; SELECT * FROM mt.n", selectCount: 3},
-		{query: "SET DIST_SQL = 'on'", miscCount: 1},
+		{query: "SET DISTSQL = 'on'", miscCount: 1},
 		{query: "SELECT * FROM mt.n", selectCount: 1, distSQLSelectCount: 1},
-		{query: "SET DIST_SQL = 'off'", miscCount: 1},
+		{query: "SET DISTSQL = 'off'", miscCount: 1},
 		{query: "DROP TABLE mt.n", ddlCount: 1},
 		{query: "SET database = system", miscCount: 1},
 	}
 
-	// Initialize accum while accounting for system migrations that may have run
-	// DDL statements.
-	accum := queryCounter{ddlCount: s.MustGetSQLCounter(sql.MetaDdl.Name)}
+	accum := initializeQueryCounter(s)
 
 	for _, tc := range testcases {
 		t.Run(tc.query, func(t *testing.T) {
@@ -96,7 +97,7 @@ func TestQueryCounts(t *testing.T) {
 			if accum.txnRollbackCount, err = checkCounterDelta(s, sql.MetaTxnRollback, accum.txnRollbackCount, tc.txnRollbackCount); err != nil {
 				t.Errorf("%q: %s", tc.query, err)
 			}
-			if err := checkCounterEQ(s, sql.MetaTxnAbort, 0); err != nil {
+			if accum.txnAbortCount, err = checkCounterDelta(s, sql.MetaTxnAbort, accum.txnAbortCount, 0); err != nil {
 				t.Errorf("%q: %s", tc.query, err)
 			}
 			if accum.selectCount, err = checkCounterDelta(s, sql.MetaSelect, accum.selectCount, tc.selectCount); err != nil {
@@ -124,9 +125,11 @@ func TestQueryCounts(t *testing.T) {
 func TestAbortCountConflictingWrites(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 
-	params, cmdFilters := createTestServerParams()
+	params, cmdFilters := tests.CreateTestServerParams()
 	s, sqlDB, _ := serverutils.StartServer(t, params)
-	defer s.Stopper().Stop()
+	defer s.Stopper().Stop(context.TODO())
+
+	accum := initializeQueryCounter(s)
 
 	if _, err := sqlDB.Exec("CREATE DATABASE db"); err != nil {
 		t.Fatal(err)
@@ -154,28 +157,34 @@ func TestAbortCountConflictingWrites(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	// Run a batch of statements to move the txn out of the AutoRetry state,
+	// otherwise the INSERT below would be automatically retried.
+	if _, err := txn.Exec("SELECT 1"); err != nil {
+		t.Fatal(err)
+	}
+
 	_, err = txn.Exec("INSERT INTO db.t VALUES ('key', 'marker')")
 	if !testutils.IsError(err, "aborted") {
-		t.Fatal(err)
+		t.Fatalf("expected aborted error, got: %v", err)
 	}
 
 	if err = txn.Rollback(); err != nil {
 		t.Fatal(err)
 	}
 
-	if err := checkCounterEQ(s, sql.MetaTxnAbort, 1); err != nil {
+	if _, err := checkCounterDelta(s, sql.MetaTxnAbort, accum.txnAbortCount, 1); err != nil {
 		t.Error(err)
 	}
-	if err := checkCounterEQ(s, sql.MetaTxnBegin, 1); err != nil {
+	if _, err := checkCounterDelta(s, sql.MetaTxnBegin, accum.txnBeginCount, 1); err != nil {
 		t.Error(err)
 	}
-	if err := checkCounterEQ(s, sql.MetaTxnRollback, 0); err != nil {
+	if _, err := checkCounterDelta(s, sql.MetaTxnRollback, accum.txnRollbackCount, 0); err != nil {
 		t.Error(err)
 	}
-	if err := checkCounterEQ(s, sql.MetaTxnCommit, 0); err != nil {
+	if _, err := checkCounterDelta(s, sql.MetaTxnCommit, accum.txnCommitCount, 0); err != nil {
 		t.Error(err)
 	}
-	if err := checkCounterEQ(s, sql.MetaInsert, 1); err != nil {
+	if _, err := checkCounterDelta(s, sql.MetaInsert, accum.insertCount, 1); err != nil {
 		t.Error(err)
 	}
 }
@@ -184,9 +193,11 @@ func TestAbortCountConflictingWrites(t *testing.T) {
 // results in an error during a txn.
 func TestAbortCountErrorDuringTransaction(t *testing.T) {
 	defer leaktest.AfterTest(t)()
-	params, _ := createTestServerParams()
+	params, _ := tests.CreateTestServerParams()
 	s, sqlDB, _ := serverutils.StartServer(t, params)
-	defer s.Stopper().Stop()
+	defer s.Stopper().Stop(context.TODO())
+
+	accum := initializeQueryCounter(s)
 
 	txn, err := sqlDB.Begin()
 	if err != nil {
@@ -197,13 +208,17 @@ func TestAbortCountErrorDuringTransaction(t *testing.T) {
 		t.Fatal("Expected an error but didn't get one")
 	}
 
-	if err := checkCounterEQ(s, sql.MetaTxnAbort, 1); err != nil {
+	if _, err := checkCounterDelta(s, sql.MetaTxnAbort, accum.txnAbortCount, 1); err != nil {
 		t.Error(err)
 	}
-	if err := checkCounterEQ(s, sql.MetaTxnBegin, 1); err != nil {
+	if _, err := checkCounterDelta(s, sql.MetaTxnBegin, accum.txnBeginCount, 1); err != nil {
 		t.Error(err)
 	}
-	if err := checkCounterEQ(s, sql.MetaSelect, 1); err != nil {
+	if _, err := checkCounterDelta(s, sql.MetaSelect, accum.selectCount, 1); err != nil {
 		t.Error(err)
+	}
+
+	if err := txn.Rollback(); err != nil {
+		t.Fatal(err)
 	}
 }

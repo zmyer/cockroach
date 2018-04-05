@@ -11,29 +11,18 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
 // implied. See the License for the specific language governing
 // permissions and limitations under the License.
-//
-// Author: Spencer Kimball (spencer.kimball@gmail.com)
 
 package main
 
+// The ccl hook import below means building this will produce CCL'ed binaries.
+// This file itself remains Apache2 to preserve the organization of ccl code
+// under the /pkg/ccl subtree, but is unused for pure FLOSS builds.
 import (
-	"fmt"
-	"math/rand"
-	"os"
-
+	_ "github.com/cockroachdb/cockroach/pkg/ccl" // ccl init hooks
 	"github.com/cockroachdb/cockroach/pkg/cli"
-	"github.com/cockroachdb/cockroach/pkg/util/randutil"
+	_ "github.com/cockroachdb/cockroach/pkg/ui/distccl" // ccl web UI init hook
 )
 
 func main() {
-	// Seed the math/rand RNG from crypto/rand.
-	rand.Seed(randutil.NewPseudoSeed())
-
-	if len(os.Args) == 1 {
-		os.Args = append(os.Args, "help")
-	}
-	if err := cli.Run(os.Args[1:]); err != nil {
-		fmt.Fprintf(os.Stderr, "Failed running %q\n", os.Args[1])
-		os.Exit(cli.ErrorCode)
-	}
+	cli.Main()
 }

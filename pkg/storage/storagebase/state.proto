@@ -11,18 +11,16 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
 // implied. See the License for the specific language governing
 // permissions and limitations under the License.
-//
-// Author: Tobias Schottdorf (tobias.schottdorf@gmail.com)
 
 syntax = "proto3";
 package cockroach.storage.storagebase;
 option go_package = "storagebase";
 
-import "cockroach/pkg/storage/engine/enginepb/mvcc.proto";
-import "cockroach/pkg/roachpb/internal_raft.proto";
-import "cockroach/pkg/roachpb/metadata.proto";
-import "cockroach/pkg/roachpb/data.proto";
-import "cockroach/pkg/util/hlc/timestamp.proto";
+import "storage/engine/enginepb/mvcc.proto";
+import "roachpb/internal_raft.proto";
+import "roachpb/metadata.proto";
+import "roachpb/data.proto";
+import "util/hlc/timestamp.proto";
 
 import "gogoproto/gogo.proto";
 
@@ -38,6 +36,8 @@ import "gogoproto/gogo.proto";
 // For the ReplicaState persisted on the Replica, all optional fields are
 // populated (i.e. no nil pointers or enums with the default value).
 message ReplicaState {
+  option (gogoproto.equal) = true;
+
   // The highest (and last) index applied to the state machine.
   uint64 raft_applied_index = 1;
   // The highest (and last) lease index applied to the state machine.
@@ -49,49 +49,62 @@ message ReplicaState {
   // Changes of the descriptor should always go through one of the
   // (*Replica).setDesc* methods.
   roachpb.RangeDescriptor desc = 3;
-  // The latest range lease, if any.
+  // The latest range lease.
+  //
+  // Note that this message is both sent over the network and used to model
+  // replica state in memory. In memory (storage.Replica.mu.state), the lease
+  // is never nil (and never zero-valued), but it may be nil when sent over
+  // the network as part of ReplicatedEvalResult.
   roachpb.Lease lease = 4;
   // The truncation state of the Raft log.
   roachpb.RaftTruncatedState truncated_state = 5;
   // gcThreshold is the GC threshold of the Range, typically updated when keys
   // are garbage collected. Reads and writes at timestamps <= this time will
   // not be served.
-  //
-  // TODO(tschottdorf): should be nullable to keep ReplicaState small as we are
-  // sending it over the wire. Since we only ever increase gc_threshold, that's
-  // the only upshot - fields which can return to the zero value must
-  // special-case that value simply because otherwise there's no way of
-  // distinguishing "no update" to and updating to the zero value.
-  util.hlc.Timestamp gc_threshold = 6 [(gogoproto.nullable) = false,
-      (gogoproto.customname) = "GCThreshold"];
-  storage.engine.enginepb.MVCCStats stats = 7 [(gogoproto.nullable) = false];
+  util.hlc.Timestamp gc_threshold = 6 [(gogoproto.customname) = "GCThreshold", (gogoproto.moretags) = "cockroachdb:\"randnullable\""];
+  storage.engine.enginepb.MVCCStats stats = 7;
   reserved 8;
   // txn_span_gc_threshold is the (maximum) timestamp below which transaction
   // records may have been garbage collected (as measured by txn.LastActive()).
   // Transaction at lower timestamps must not be allowed to write their initial
   // transaction entry.
-  //
-  // TODO(tschottdorf): should be nullable; see gc_threshold.
-  util.hlc.Timestamp txn_span_gc_threshold = 9 [(gogoproto.nullable) = false,
-      (gogoproto.customname) = "TxnSpanGCThreshold"];
-  // Use an enum because proto3 does not give nullable primitive values, and we
-  // need to be able to send EvalResults which don't specify frozen.
-  enum FrozenEnum {
-    FROZEN_UNSPECIFIED = 0;
-    FROZEN = 1;
-    UNFROZEN = 2;
-  }
-  FrozenEnum frozen  = 10;
+  util.hlc.Timestamp txn_span_gc_threshold = 9 [(gogoproto.customname) = "TxnSpanGCThreshold", (gogoproto.moretags) = "cockroachdb:\"randnullable\""];
+
+  reserved 10;
 }
 
 message RangeInfo {
+  option (gogoproto.equal) = true;
+
   ReplicaState state = 1 [(gogoproto.nullable) = false, (gogoproto.embed) = true];
   // The highest (and last) index in the Raft log.
-  uint64 lastIndex = 2;
+  uint64 last_index = 2;
   uint64 num_pending = 3;
   reserved 4; // previously last verification timestamp for verify queue.
   uint64 num_dropped = 5;
   // raft_log_size may be initially inaccurate after a server restart.
   // See storage.Replica.mu.raftLogSize.
   int64 raft_log_size = 6;
+  // Approximately the amount of quota available.
+  int64 approximate_proposal_quota = 7;
+}
+
+// CommandQueueSnapshot is a snapshot of the command queue graph for rendering
+// on an admin UI debug page. While the actual CommandQueue uses interval trees
+// for fast mutation and lookups, all the UI needs is a simple map of commands.
+message CommandQueuesSnapshot {
+  message Command {
+    int64 id = 1;
+    string key = 2;
+    string end_key = 3;
+    bool readonly = 4;
+    util.hlc.Timestamp timestamp = 5 [(gogoproto.nullable) = false];
+    repeated int64 prereqs = 6;
+  }
+
+  // Timestamp in nanoseconds when this snapshot was taken.
+  util.hlc.Timestamp timestamp = 1 [(gogoproto.nullable) = false];
+  // localScope and globalScope are maps from command ids to commands.
+  map<int64, Command> localScope = 2 [(gogoproto.nullable) = false];
+  map<int64, Command> globalScope = 3 [(gogoproto.nullable) = false];
 }

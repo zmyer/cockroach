@@ -11,29 +11,27 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
 // implied. See the License for the specific language governing
 // permissions and limitations under the License.
-//
-// Author: Peter Mattis (peter@cockroachlabs.com)
 
 package client
 
 import (
 	"bytes"
-	"errors"
+	"context"
 	"fmt"
 
-	"golang.org/x/net/context"
+	"github.com/pkg/errors"
 
 	"github.com/cockroachdb/cockroach/pkg/base"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
+	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
+	"github.com/cockroachdb/cockroach/pkg/util/protoutil"
 	"github.com/cockroachdb/cockroach/pkg/util/retry"
 	"github.com/cockroachdb/cockroach/pkg/util/tracing"
-	"github.com/gogo/protobuf/proto"
 )
 
-// KeyValue represents a single key/value pair and corresponding
-// timestamp. This is similar to roachpb.KeyValue except that the value may be
-// nil.
+// KeyValue represents a single key/value pair. This is similar to
+// roachpb.KeyValue except that the value may be nil.
 type KeyValue struct {
 	Key   roachpb.Key
 	Value *roachpb.Value // Timestamp will always be zero
@@ -77,9 +75,9 @@ func (kv *KeyValue) PrettyValue() string {
 		if err != nil {
 			return fmt.Sprintf("%v", err)
 		}
-		return fmt.Sprintf("%s", v)
+		return v.String()
 	}
-	return fmt.Sprintf("%q", kv.Value.RawBytes)
+	return fmt.Sprintf("%x", kv.Value.RawBytes)
 }
 
 // ValueBytes returns the value as a byte slice. This method will panic if the
@@ -109,7 +107,7 @@ func (kv *KeyValue) ValueInt() int64 {
 }
 
 // ValueProto parses the byte slice value into msg.
-func (kv *KeyValue) ValueProto(msg proto.Message) error {
+func (kv *KeyValue) ValueProto(msg protoutil.Message) error {
 	if kv.Value == nil {
 		msg.Reset()
 		return nil
@@ -127,7 +125,7 @@ type Result struct {
 	// returned varies by operation. For Get, Put, CPut, Inc and Del the number
 	// of rows returned is the number of keys operated on. For Scan the number of
 	// rows returned is the number or rows matching the scan capped by the
-	// maxRows parameter. For DelRange Rows is nil.
+	// maxRows parameter and other options. For DelRange Rows is nil.
 	Rows []KeyValue
 
 	// Keys is set by some operations instead of returning the rows themselves.
@@ -140,6 +138,15 @@ type Result struct {
 	// a new shorter span of keys. An empty span is returned when the
 	// operation has successfully completed running through the span.
 	ResumeSpan roachpb.Span
+	// When ResumeSpan is populated, this specifies the reason why the operation
+	// wasn't completed and needs to be resumed.
+	ResumeReason roachpb.ResponseHeader_ResumeReason
+
+	// RangeInfos contains information about the replicas that produced this
+	// result.
+	// This is only populated if Err == nil and if ReturnRangeInfo has been set on
+	// the request.
+	RangeInfos []roachpb.RangeInfo
 }
 
 func (r Result) String() string {
@@ -162,42 +169,51 @@ type DBContext struct {
 	// userPriority is set to any value except 1 in call arguments, this
 	// value is ignored.
 	UserPriority roachpb.UserPriority
-
-	// TxnRetryOptions controls the retries of restarted transactions.
-	TxnRetryOptions retry.Options
+	// NodeID provides the node ID for setting the gateway node and avoiding
+	// clock uncertainty for root transactions started at the gateway.
+	NodeID *base.NodeIDContainer
 }
 
 // DefaultDBContext returns (a copy of) the default options for
 // NewDBWithContext.
 func DefaultDBContext() DBContext {
 	return DBContext{
-		UserPriority:    roachpb.NormalUserPriority,
-		TxnRetryOptions: base.DefaultRetryOptions(),
+		UserPriority: roachpb.NormalUserPriority,
+		NodeID:       &base.NodeIDContainer{},
 	}
 }
 
 // DB is a database handle to a single cockroach cluster. A DB is safe for
 // concurrent use by multiple goroutines.
 type DB struct {
-	sender Sender
-	ctx    DBContext
+	factory TxnSenderFactory
+	clock   *hlc.Clock
+	ctx     DBContext
 }
 
-// GetSender returns the underlying Sender. Only exported for tests.
+// GetSender returns a transaction-capable Sender instance. The same
+// sender must be used for the entirety of a transaction. Get a new
+// instance to start a new transaction.
 func (db *DB) GetSender() Sender {
-	return db.sender
+	return db.factory.New(RootTxn)
+}
+
+// GetFactory returns the DB's TxnSenderFactory.
+func (db *DB) GetFactory() TxnSenderFactory {
+	return db.factory
 }
 
 // NewDB returns a new DB.
-func NewDB(sender Sender) *DB {
-	return NewDBWithContext(sender, DefaultDBContext())
+func NewDB(factory TxnSenderFactory, clock *hlc.Clock) *DB {
+	return NewDBWithContext(factory, clock, DefaultDBContext())
 }
 
 // NewDBWithContext returns a new DB with the given parameters.
-func NewDBWithContext(sender Sender, ctx DBContext) *DB {
+func NewDBWithContext(factory TxnSenderFactory, clock *hlc.Clock, ctx DBContext) *DB {
 	return &DB{
-		sender: sender,
-		ctx:    ctx,
+		factory: factory,
+		clock:   clock,
+		ctx:     ctx,
 	}
 }
 
@@ -218,7 +234,7 @@ func (db *DB) Get(ctx context.Context, key interface{}) (KeyValue, error) {
 // message. If the key doesn't exist, the proto will simply be reset.
 //
 // key can be either a byte slice or a string.
-func (db *DB) GetProto(ctx context.Context, key interface{}, msg proto.Message) error {
+func (db *DB) GetProto(ctx context.Context, key interface{}, msg protoutil.Message) error {
 	r, err := db.Get(ctx, key)
 	if err != nil {
 		return err
@@ -229,7 +245,7 @@ func (db *DB) GetProto(ctx context.Context, key interface{}, msg proto.Message) 
 // Put sets the value for a key.
 //
 // key can be either a byte slice or a string. value can be any key type, a
-// proto.Message or any Go primitive type (bool, int, etc).
+// protoutil.Message or any Go primitive type (bool, int, etc).
 func (db *DB) Put(ctx context.Context, key, value interface{}) error {
 	b := &Batch{}
 	b.Put(key, value)
@@ -242,7 +258,7 @@ func (db *DB) Put(ctx context.Context, key, value interface{}) error {
 // with caution.
 //
 // key can be either a byte slice or a string. value can be any key type, a
-// proto.Message or any Go primitive type (bool, int, etc).
+// protoutil.Message or any Go primitive type (bool, int, etc).
 func (db *DB) PutInline(ctx context.Context, key, value interface{}) error {
 	b := &Batch{}
 	b.PutInline(key, value)
@@ -257,22 +273,24 @@ func (db *DB) PutInline(ctx context.Context, key, value interface{}) error {
 // Returns an error if the existing value is not equal to expValue.
 //
 // key can be either a byte slice or a string. value can be any key type, a
-// proto.Message or any Go primitive type (bool, int, etc).
+// protoutil.Message or any Go primitive type (bool, int, etc).
 func (db *DB) CPut(ctx context.Context, key, value, expValue interface{}) error {
 	b := &Batch{}
 	b.CPut(key, value, expValue)
 	return getOneErr(db.Run(ctx, b), b)
 }
 
-// InitPut sets the first value for a key to value. An error is reported if a
-// value already exists for the key and it's not equal to the value passed in.
+// InitPut sets the first value for a key to value. A ConditionFailedError is
+// reported if a value already exists for the key and it's not equal to the
+// value passed in. If failOnTombstones is set to true, tombstones count as
+// mismatched values and will cause a ConditionFailedError.
 //
 // key can be either a byte slice or a string. value can be any key type, a
-// proto.Message or any Go primitive type (bool, int, etc). It is illegal to
+// protoutil.Message or any Go primitive type (bool, int, etc). It is illegal to
 // set value to nil.
-func (db *DB) InitPut(ctx context.Context, key, value interface{}) error {
+func (db *DB) InitPut(ctx context.Context, key, value interface{}, failOnTombstones bool) error {
 	b := &Batch{}
-	b.InitPut(key, value)
+	b.InitPut(key, value, failOnTombstones)
 	return getOneErr(db.Run(ctx, b), b)
 }
 
@@ -364,10 +382,18 @@ func (db *DB) AdminMerge(ctx context.Context, key interface{}) error {
 
 // AdminSplit splits the range at splitkey.
 //
-// key can be either a byte slice or a string.
-func (db *DB) AdminSplit(ctx context.Context, splitKey interface{}) error {
+// spanKey is a key within the range that should be split, and splitKey is the
+// key at which that range should be split. splitKey is not used exactly as
+// provided--it is first mutated by keys.EnsureSafeSplitKey. Accounting for
+// this mutation sometimes requires constructing a key that falls in a
+// different range, hence the separation between spanKey and splitKey. See
+// #16008 for details, and #16344 for the tracking issue to clean this mess up
+// properly.
+//
+// The keys can be either byte slices or a strings.
+func (db *DB) AdminSplit(ctx context.Context, spanKey, splitKey interface{}) error {
 	b := &Batch{}
-	b.adminSplit(splitKey)
+	b.adminSplit(spanKey, splitKey)
 	return getOneErr(db.Run(ctx, b), b)
 }
 
@@ -389,6 +415,18 @@ func (db *DB) AdminTransferLease(
 	return getOneErr(db.Run(ctx, b), b)
 }
 
+// AdminChangeReplicas adds or removes a set of replicas for a range.
+func (db *DB) AdminChangeReplicas(
+	ctx context.Context,
+	key interface{},
+	changeType roachpb.ReplicaChangeType,
+	targets []roachpb.ReplicationTarget,
+) error {
+	b := &Batch{}
+	b.adminChangeReplicas(key, changeType, targets)
+	return getOneErr(db.Run(ctx, b), b)
+}
+
 // CheckConsistency runs a consistency check on all the ranges containing
 // the key span. It logs a diff of all the keys that are inconsistent
 // when withDiff is set to true.
@@ -398,34 +436,41 @@ func (db *DB) CheckConsistency(ctx context.Context, begin, end interface{}, with
 	return getOneErr(db.Run(ctx, b), b)
 }
 
+// WriteBatch applies the operations encoded in a BatchRepr, which is the
+// serialized form of a RocksDB Batch. The command cannot span Ranges and must
+// be run on an empty keyrange.
+func (db *DB) WriteBatch(ctx context.Context, begin, end interface{}, data []byte) error {
+	b := &Batch{}
+	b.writeBatch(begin, end, data)
+	return getOneErr(db.Run(ctx, b), b)
+}
+
+// AddSSTable links a file into the RocksDB log-structured merge-tree. Existing
+// data in the range is cleared.
+func (db *DB) AddSSTable(ctx context.Context, begin, end interface{}, data []byte) error {
+	b := &Batch{}
+	b.addSSTable(begin, end, data)
+	return getOneErr(db.Run(ctx, b), b)
+}
+
 // sendAndFill is a helper which sends the given batch and fills its results,
 // returning the appropriate error which is either from the first failing call,
 // or an "internal" error.
-func sendAndFill(
-	send func(roachpb.BatchRequest) (*roachpb.BatchResponse, *roachpb.Error), b *Batch,
-) error {
+func sendAndFill(ctx context.Context, send SenderFunc, b *Batch) error {
 	// Errors here will be attached to the results, so we will get them from
 	// the call to fillResults in the regular case in which an individual call
 	// fails. But send() also returns its own errors, so there's some dancing
 	// here to do because we want to run fillResults() so that the individual
 	// result gets initialized with an error from the corresponding call.
 	var ba roachpb.BatchRequest
-	// TODO(tschottdorf): this nonsensical copy is required since (at least at
-	// the time of writing, the chunking and masking in DistSender operates on
-	// the original data (as attested to by a whole bunch of test failures).
-	ba.Requests = append([]roachpb.RequestUnion(nil), b.reqs...)
+	ba.Requests = b.reqs
 	ba.Header = b.Header
-	b.response, b.pErr = send(ba)
-	if b.pErr != nil {
-		// Discard errors from fillResults.
-		_ = b.fillResults()
-		return b.pErr.GoError()
+	b.response, b.pErr = send(ctx, ba)
+	b.fillResults(ctx)
+	if b.pErr == nil {
+		b.pErr = roachpb.NewError(b.resultErr())
 	}
-	if err := b.fillResults(); err != nil {
-		b.pErr = roachpb.NewError(err)
-		return err
-	}
-	return nil
+	return b.pErr.GoError()
 }
 
 // Run executes the operations queued up within a batch. Before executing any
@@ -443,10 +488,7 @@ func (db *DB) Run(ctx context.Context, b *Batch) error {
 	if err := b.prepare(); err != nil {
 		return err
 	}
-	sendFn := func(br roachpb.BatchRequest) (*roachpb.BatchResponse, *roachpb.Error) {
-		return db.send(ctx, br)
-	}
-	return sendAndFill(sendFn, b)
+	return sendAndFill(ctx, db.send, b)
 }
 
 // Txn executes retryable in the context of a distributed transaction. The
@@ -456,46 +498,33 @@ func (db *DB) Run(ctx context.Context, b *Batch) error {
 // cause problems in the event it must be run more than once.
 //
 // If you need more control over how the txn is executed, check out txn.Exec().
-func (db *DB) Txn(ctx context.Context, retryable func(txn *Txn) error) error {
+func (db *DB) Txn(ctx context.Context, retryable func(context.Context, *Txn) error) error {
 	// TODO(radu): we should open a tracing Span here (we need to figure out how
 	// to use the correct tracer).
-	// TODO(dan): This context should, at longest, live for the lifetime of this
-	// method. Add a defered cancel.
-	txn := NewTxn(ctx, *db)
-	txn.SetDebugName("", 1)
-	err := txn.Exec(TxnExecOptions{AutoRetry: true, AutoCommit: true},
-		func(txn *Txn, _ *TxnExecOptions) error {
-			return retryable(txn)
-		})
-	if err != nil {
-		txn.CleanupOnError(err)
+
+	// TODO(andrei): revisit this when TxnSender is moved to the client
+	// (https://github.com/cockroachdb/cockroach/issues/10511).
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	txn := NewTxn(db, db.ctx.NodeID.Get(), RootTxn)
+	txn.SetDebugName("unnamed")
+	opts := TxnExecOptions{
+		AutoCommit: true,
+		AutoRetry:  true,
 	}
-	// Terminate RetryableTxnError here, so it doesn't cause a higher-level txn to
-	// be retried. We don't do this in any of the other functions in DB; I guess
-	// we should.
-	if _, ok := err.(*roachpb.RetryableTxnError); ok {
-		return errors.New(err.Error())
+	err := txn.Exec(ctx, opts, func(ctx context.Context, txn *Txn, _ *TxnExecOptions) error {
+		return retryable(ctx, txn)
+	})
+	if err != nil {
+		txn.CleanupOnError(ctx, err)
+	}
+	// Terminate HandledRetryableTxnError here, so it doesn't cause a higher-level
+	// txn to be retried. We don't do this in any of the other functions in DB; I
+	// guess we should.
+	if _, ok := err.(*roachpb.HandledRetryableTxnError); ok {
+		return errors.Wrapf(err, "terminated retryable error")
 	}
 	return err
-}
-
-func (db *DB) prepareToSend(ba *roachpb.BatchRequest) *roachpb.Error {
-	if ba.ReadConsistency == roachpb.INCONSISTENT {
-		for _, ru := range ba.Requests {
-			req := ru.GetInner()
-			if req.Method() != roachpb.Get && req.Method() != roachpb.Scan &&
-				req.Method() != roachpb.ReverseScan {
-				return roachpb.NewErrorf("method %s not allowed with INCONSISTENT batch", req.Method)
-			}
-		}
-	}
-
-	if db.ctx.UserPriority != 1 {
-		ba.UserPriority = db.ctx.UserPriority
-	}
-
-	tracing.AnnotateTrace()
-	return nil
 }
 
 // send runs the specified calls synchronously in a single batch and returns
@@ -503,14 +532,25 @@ func (db *DB) prepareToSend(ba *roachpb.BatchRequest) *roachpb.Error {
 func (db *DB) send(
 	ctx context.Context, ba roachpb.BatchRequest,
 ) (*roachpb.BatchResponse, *roachpb.Error) {
+	return db.sendUsingSender(ctx, ba, db.GetSender())
+}
+
+// sendUsingSender uses the specified sender to send the batch request.
+func (db *DB) sendUsingSender(
+	ctx context.Context, ba roachpb.BatchRequest, sender Sender,
+) (*roachpb.BatchResponse, *roachpb.Error) {
 	if len(ba.Requests) == 0 {
 		return nil, nil
 	}
-	if pErr := db.prepareToSend(&ba); pErr != nil {
-		return nil, pErr
+	if err := ba.ReadConsistency.SupportsBatch(ba); err != nil {
+		return nil, roachpb.NewError(err)
+	}
+	if ba.UserPriority == 0 && db.ctx.UserPriority != 1 {
+		ba.UserPriority = db.ctx.UserPriority
 	}
 
-	br, pErr := db.sender.Send(ctx, ba)
+	tracing.AnnotateTrace()
+	br, pErr := sender.Send(ctx, ba)
 	if pErr != nil {
 		if log.V(1) {
 			log.Infof(ctx, "failed batch: %s", pErr)
@@ -553,4 +593,23 @@ func getOneRow(runErr error, b *Batch) (KeyValue, error) {
 		return KeyValue{}, err
 	}
 	return res.Rows[0], nil
+}
+
+// IncrementValRetryable increments a key's value by a specified amount and
+// returns the new value.
+//
+// It performs the increment as a retryable non-transactional increment. The key
+// might be incremented multiple times because of the retries.
+func IncrementValRetryable(ctx context.Context, db *DB, key roachpb.Key, inc int64) (int64, error) {
+	var err error
+	var res KeyValue
+	for r := retry.Start(base.DefaultRetryOptions()); r.Next(); {
+		res, err = db.Inc(ctx, key, inc)
+		switch err.(type) {
+		case *roachpb.UnhandledRetryableError, *roachpb.AmbiguousResultError:
+			continue
+		}
+		break
+	}
+	return res.ValueInt(), err
 }

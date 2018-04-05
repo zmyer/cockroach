@@ -11,25 +11,23 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
 // implied. See the License for the specific language governing
 // permissions and limitations under the License.
-//
-// Author: Matt Tracy (matt@cockroachlabs.com)
 
 package ts
 
 import (
-	"bytes"
-	"fmt"
+	"context"
 	"math"
 	"reflect"
 	"sync"
 	"testing"
 	"time"
 
-	"golang.org/x/net/context"
+	"github.com/kr/pretty"
 
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/kv"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
+	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/storage/engine"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/localtestcluster"
@@ -37,9 +35,9 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
+	"github.com/cockroachdb/cockroach/pkg/util/mon"
 	"github.com/cockroachdb/cockroach/pkg/util/stop"
 	"github.com/cockroachdb/cockroach/pkg/util/tracing"
-	"github.com/gogo/protobuf/proto"
 )
 
 // testModel is a model-based testing structure used to verify that time
@@ -61,17 +59,42 @@ type testModel struct {
 	modelData   map[string]roachpb.Value
 	seenSources map[string]struct{}
 	*localtestcluster.LocalTestCluster
-	DB *DB
+	DB                *DB
+	workerMemMonitor  *mon.BytesMonitor
+	resultMemMonitor  *mon.BytesMonitor
+	queryMemoryBudget int64
 }
 
 // newTestModel creates a new testModel instance. The Start() method must
 // be called before using it.
 func newTestModel(t *testing.T) testModel {
+	st := cluster.MakeTestingClusterSettings()
+	workerMonitor := mon.MakeUnlimitedMonitor(
+		context.Background(),
+		"timeseries-test-worker",
+		mon.MemoryResource,
+		nil,
+		nil,
+		math.MaxInt64,
+		st,
+	)
+	resultMonitor := mon.MakeUnlimitedMonitor(
+		context.Background(),
+		"timeseries-test-result",
+		mon.MemoryResource,
+		nil,
+		nil,
+		math.MaxInt64,
+		st,
+	)
 	return testModel{
-		t:                t,
-		modelData:        make(map[string]roachpb.Value),
-		seenSources:      make(map[string]struct{}),
-		LocalTestCluster: &localtestcluster.LocalTestCluster{},
+		t:                 t,
+		modelData:         make(map[string]roachpb.Value),
+		seenSources:       make(map[string]struct{}),
+		LocalTestCluster:  &localtestcluster.LocalTestCluster{},
+		workerMemMonitor:  &workerMonitor,
+		resultMemMonitor:  &resultMonitor,
+		queryMemoryBudget: math.MaxInt64,
 	}
 }
 
@@ -79,8 +102,8 @@ func newTestModel(t *testing.T) testModel {
 // time series DB.
 func (tm *testModel) Start() {
 	tm.LocalTestCluster.Start(tm.t, testutils.NewNodeTestBaseContext(),
-		kv.InitSenderForLocalTestCluster)
-	tm.DB = NewDB(tm.LocalTestCluster.DB)
+		kv.InitFactoryForLocalTestCluster)
+	tm.DB = NewDB(tm.LocalTestCluster.DB, tm.Cfg.Settings)
 }
 
 // getActualData returns the actual value of all time series keys in the
@@ -91,7 +114,7 @@ func (tm *testModel) getActualData() map[string]roachpb.Value {
 	endKey := startKey.PrefixEnd()
 	keyValues, _, _, err := engine.MVCCScan(context.Background(), tm.Eng, startKey, endKey, math.MaxInt64, tm.Clock.Now(), true, nil)
 	if err != nil {
-		tm.t.Fatalf("error scanning TS data from engine: %s", err.Error())
+		tm.t.Fatalf("error scanning TS data from engine: %s", err)
 	}
 
 	kvMap := make(map[string]roachpb.Value)
@@ -107,50 +130,12 @@ func (tm *testModel) getActualData() map[string]roachpb.Value {
 // engine. If the actual data does not match the model, this method will print
 // out detailed information about the differences between the two data sets.
 func (tm *testModel) assertModelCorrect() {
+	tm.t.Helper()
 	actualData := tm.getActualData()
 	if !reflect.DeepEqual(tm.modelData, actualData) {
-		// Provide a detailed differencing of the actual data and the expected
-		// model. This is done by comparing individual keys, and printing human
-		// readable information about any keys which differ in value between the
-		// two data sets.
-		var buf bytes.Buffer
-		buf.WriteString("Found unexpected differences in model data and actual data:\n")
-		for k, vActual := range actualData {
-			n, s, r, ts, err := DecodeDataKey([]byte(k))
-			if err != nil {
-				tm.t.Fatal(err)
-			}
-			if vModel, ok := tm.modelData[k]; !ok {
-				fmt.Fprintf(&buf, "\nKey %s/%s@%d, r:%d from actual data was not found in model", n, s, ts, r)
-			} else {
-				if !proto.Equal(&vActual, &vModel) {
-					fmt.Fprintf(&buf, "\nKey %s/%s@%d, r:%d differs between model and actual:", n, s, ts, r)
-					if its, err := vActual.GetTimeseries(); err != nil {
-						fmt.Fprintf(&buf, "\nActual value is not a valid time series: %v", vActual)
-					} else {
-						fmt.Fprintf(&buf, "\nActual value: %s", &its)
-					}
-					if its, err := vModel.GetTimeseries(); err != nil {
-						fmt.Fprintf(&buf, "\nModel value is not a valid time series: %v", vModel)
-					} else {
-						fmt.Fprintf(&buf, "\nModel value: %s", &its)
-					}
-				}
-			}
+		for _, diff := range pretty.Diff(tm.modelData, actualData) {
+			tm.t.Error(diff)
 		}
-
-		// Detect keys in model which were not present in the actual data.
-		for k := range tm.modelData {
-			n, s, r, ts, err := DecodeDataKey([]byte(k))
-			if err != nil {
-				tm.t.Fatal(err)
-			}
-			if _, ok := actualData[k]; !ok {
-				fmt.Fprintf(&buf, "Key %s/%s@%d, r:%d from model was not found in actual data", n, s, ts, r)
-			}
-		}
-
-		tm.t.Fatal(buf.String())
 	}
 }
 
@@ -164,13 +149,17 @@ func (tm *testModel) assertKeyCount(expected int) {
 }
 
 func (tm *testModel) storeInModel(r Resolution, data tspb.TimeSeriesData) {
+	if !TimeseriesStorageEnabled.Get(&tm.Cfg.Settings.SV) {
+		return
+	}
+
 	// Note the source, used to construct keys for model queries.
 	tm.seenSources[data.Source] = struct{}{}
 
 	// Process and store data in the model.
 	internalData, err := data.ToInternal(r.SlabDuration(), r.SampleDuration())
 	if err != nil {
-		tm.t.Fatalf("test could not convert time series to internal format: %s", err.Error())
+		tm.t.Fatalf("test could not convert time series to internal format: %s", err)
 	}
 
 	for _, idata := range internalData {
@@ -182,16 +171,16 @@ func (tm *testModel) storeInModel(r Resolution, data tspb.TimeSeriesData) {
 		if ok {
 			existingTs, err := existing.GetTimeseries()
 			if err != nil {
-				tm.t.Fatalf("test could not extract time series from existing model value: %s", err.Error())
+				tm.t.Fatalf("test could not extract time series from existing model value: %s", err)
 			}
 			newTs, err = engine.MergeInternalTimeSeriesData(existingTs, idata)
 			if err != nil {
-				tm.t.Fatalf("test could not merge time series into model value: %s", err.Error())
+				tm.t.Fatalf("test could not merge time series into model value: %s", err)
 			}
 		} else {
 			newTs, err = engine.MergeInternalTimeSeriesData(idata)
 			if err != nil {
-				tm.t.Fatalf("test could not merge time series into model value: %s", err.Error())
+				tm.t.Fatalf("test could not merge time series into model value: %s", err)
 			}
 		}
 		var val roachpb.Value
@@ -207,7 +196,7 @@ func (tm *testModel) storeInModel(r Resolution, data tspb.TimeSeriesData) {
 func (tm *testModel) storeTimeSeriesData(r Resolution, data []tspb.TimeSeriesData) {
 	// Store data in the system under test.
 	if err := tm.DB.StoreData(context.TODO(), r, data); err != nil {
-		tm.t.Fatalf("error storing time series data: %s", err.Error())
+		tm.t.Fatalf("error storing time series data: %s", err)
 	}
 
 	// Store data in the model.
@@ -221,7 +210,7 @@ func (tm *testModel) storeTimeSeriesData(r Resolution, data []tspb.TimeSeriesDat
 // of time series/resolution pairs will be considered for deletion.
 func (tm *testModel) prune(nowNanos int64, timeSeries ...timeSeriesResolutionInfo) {
 	// Prune time series from the system under test.
-	if err := pruneTimeSeries(
+	if err := tm.DB.pruneTimeSeries(
 		context.TODO(),
 		tm.LocalTestCluster.DB,
 		timeSeries,
@@ -234,7 +223,7 @@ func (tm *testModel) prune(nowNanos int64, timeSeries ...timeSeriesResolutionInf
 	}
 
 	// Prune data from the model.
-	thresholds := computeThresholds(nowNanos)
+	thresholds := tm.DB.computeThresholds(nowNanos)
 	for k := range tm.modelData {
 		name, _, res, ts, err := DecodeDataKey(roachpb.Key(k))
 		if err != nil {
@@ -272,7 +261,7 @@ type modelDataSource struct {
 func (mds *modelDataSource) GetTimeSeriesData() []tspb.TimeSeriesData {
 	if len(mds.datasets) == 0 {
 		// Stop on goroutine to prevent deadlock.
-		go mds.once.Do(mds.stopper.Stop)
+		go mds.once.Do(func() { mds.stopper.Stop(context.Background()) })
 		return nil
 	}
 	mds.calledCount++
@@ -407,4 +396,90 @@ func TestPollSource(t *testing.T) {
 	}
 	tm.assertKeyCount(3)
 	tm.assertModelCorrect()
+}
+
+// TestDisableStorage verifies that disabling timeseries storage via the cluster
+// setting works properly.
+func TestDisableStorage(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	tm := newTestModel(t)
+	tm.Start()
+	defer tm.Stop()
+	TimeseriesStorageEnabled.Override(&tm.Cfg.Settings.SV, false)
+
+	// Basic storage operation: one data point.
+	tm.storeTimeSeriesData(Resolution10s, []tspb.TimeSeriesData{
+		{
+			Name: "test.metric",
+			Datapoints: []tspb.TimeSeriesDatapoint{
+				datapoint(-446061360000000000, 100),
+			},
+		},
+	})
+	tm.assertKeyCount(0)
+	tm.assertModelCorrect()
+
+	testSource := modelDataSource{
+		model:   tm,
+		r:       Resolution10s,
+		stopper: stop.NewStopper(),
+		datasets: [][]tspb.TimeSeriesData{
+			{
+				{
+					Name:   "test.metric.float",
+					Source: "cpu01",
+					Datapoints: []tspb.TimeSeriesDatapoint{
+						datapoint(1428713843000000000, 100.0),
+						datapoint(1428713843000000001, 50.2),
+						datapoint(1428713843000000002, 90.9),
+					},
+				},
+				{
+					Name:   "test.metric.float",
+					Source: "cpu02",
+					Datapoints: []tspb.TimeSeriesDatapoint{
+						datapoint(1428713843000000000, 900.8),
+						datapoint(1428713843000000001, 30.12),
+						datapoint(1428713843000000002, 72.324),
+					},
+				},
+			},
+			{
+				{
+					Name: "test.metric",
+					Datapoints: []tspb.TimeSeriesDatapoint{
+						datapoint(-446061360000000000, 100),
+					},
+				},
+			},
+		},
+	}
+
+	ambient := log.AmbientContext{Tracer: tracing.NewTracer()}
+	tm.DB.PollSource(ambient, &testSource, time.Millisecond, Resolution10s, testSource.stopper)
+	select {
+	case <-testSource.stopper.IsStopped():
+		t.Error("testSource data exhausted when polling should have been enabled")
+	case <-time.After(50 * time.Millisecond):
+		testSource.stopper.Stop(context.Background())
+	}
+	if a, e := testSource.calledCount, 0; a != e {
+		t.Errorf("testSource was called %d times, expected %d", a, e)
+	}
+	tm.assertKeyCount(0)
+	tm.assertModelCorrect()
+}
+
+// TestPruneThreshold verifies that `PruneThreshold` returns correct result in nanoseconds
+func TestPruneThreshold(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	tm := newTestModel(t)
+	tm.Start()
+	defer tm.Stop()
+	expected := resolution10sDefaultPruneThreshold.Nanoseconds()
+	db := NewDB(nil, tm.Cfg.Settings)
+	result := db.PruneThreshold(Resolution10s)
+	if expected != result {
+		t.Errorf("prune threshold did not match expected value: %d != %d", expected, result)
+	}
 }

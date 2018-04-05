@@ -11,8 +11,6 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
 // implied. See the License for the specific language governing
 // permissions and limitations under the License.
-//
-// Author: Tamir Duberstein (tamird@gmail.com)
 
 package main
 
@@ -23,14 +21,17 @@ import (
 
 func TestRunTC(t *testing.T) {
 	count := 0
-	runTC(func(parameters map[string]string) {
+	runTC([]string{"master"}, func(buildID, branch string, opts map[string]string) {
 		count++
-		if pkg, ok := parameters["env.PKG"]; ok {
+		if branch != "master" {
+			t.Errorf("unexpected branch %q", branch)
+		}
+		if pkg, ok := opts["env.PKG"]; ok {
 			if strings.Contains(pkg, "/vendor/") {
 				t.Errorf("unexpected package %s", pkg)
 			}
 		} else {
-			t.Errorf("parameters did not include package: %+v", parameters)
+			t.Errorf("parameters did not include package: %+v", opts)
 		}
 	})
 	if count == 0 {

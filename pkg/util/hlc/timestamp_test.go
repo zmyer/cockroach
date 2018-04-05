@@ -11,8 +11,6 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
 // implied. See the License for the specific language governing
 // permissions and limitations under the License.
-//
-// Author: Tobias Schottdorf (tobias.schottdorf@gmail.com)
 
 package hlc
 
@@ -44,22 +42,6 @@ func TestLess(t *testing.T) {
 	}
 }
 
-func TestEqual(t *testing.T) {
-	a := Timestamp{}
-	b := Timestamp{}
-	if !a.Equal(b) {
-		t.Errorf("expected %+v == %+v", a, b)
-	}
-	b = makeTS(1, 0)
-	if a.Equal(b) {
-		t.Errorf("expected %+v < %+v", a, b)
-	}
-	a = makeTS(1, 1)
-	if b.Equal(a) {
-		t.Errorf("expected %+v < %+v", b, a)
-	}
-}
-
 func TestTimestampNext(t *testing.T) {
 	testCases := []struct {
 		ts, expNext Timestamp
@@ -70,7 +52,7 @@ func TestTimestampNext(t *testing.T) {
 		{makeTS(math.MaxInt32, math.MaxInt32), makeTS(math.MaxInt32+1, 0)},
 	}
 	for i, c := range testCases {
-		if next := c.ts.Next(); !next.Equal(c.expNext) {
+		if next := c.ts.Next(); next != c.expNext {
 			t.Errorf("%d: expected %s; got %s", i, c.expNext, next)
 		}
 	}
@@ -85,7 +67,7 @@ func TestTimestampPrev(t *testing.T) {
 		{makeTS(1, 0), makeTS(0, math.MaxInt32)},
 	}
 	for i, c := range testCases {
-		if prev := c.ts.Prev(); !prev.Equal(c.expPrev) {
+		if prev := c.ts.Prev(); prev != c.expPrev {
 			t.Errorf("%d: expected %s; got %s", i, c.expPrev, prev)
 		}
 	}
